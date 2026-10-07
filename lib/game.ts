@@ -1,6 +1,8 @@
 import { Chess, type Color, type Move, type PieceSymbol, type Square } from "chess.js";
+import { getTimeControl, TIME_CONTROL_IDS } from "./clock";
 import { classify, negate, shouldPause, type Annotation, type MoveClass } from "./coach";
 import { COACH_GO, COACH_OPTIONS, Engine, opponentProfile, type Analysis, type Score } from "./engine";
+import { recordResult, type GameResult, type RatingRecord } from "./rating";
 import { getSettings, type PlayerColorChoice } from "./settings";
 import { playSound } from "./sound";
 
@@ -9,13 +11,33 @@ export interface HistoryEntry {
   color: Color;
   from: Square;
   to: Square;
+  /** Positions before and after the move, for replaying the game. */
+  before: string;
+  after: string;
   annotation: Annotation | null;
 }
 
 export type GameStatus =
   | { kind: "playing" }
   | { kind: "checkmate"; winner: Color }
-  | { kind: "draw"; reason: "stalemate" | "repetition" | "insufficient material" | "fifty-move rule" };
+  | { kind: "timeout"; winner: Color }
+  | { kind: "resigned"; winner: Color }
+  | {
+      kind: "draw";
+      reason: "stalemate" | "repetition" | "insufficient material" | "fifty-move rule" | "timeout vs insufficient material";
+    };
+
+/**
+ * Clock values in milliseconds: time left with a time control, time used without one.
+ * A running clock has `since` (performance.now) added on top by whoever displays it.
+ */
+export interface ClockSnapshot {
+  controlId: string;
+  limited: boolean;
+  values: Record<Color, number>;
+  running: Color | null;
+  since: number;
+}
 
 export interface Arrow {
   from: Square;
@@ -60,6 +82,11 @@ export interface GameSnapshot {
   arrows: Arrow[];
   feedback: Feedback | null;
   engineError: string | null;
+  clock: ClockSnapshot;
+  /** Whether this game counts towards the player's rating. */
+  rated: boolean;
+  /** The rating change this game produced, once it has ended. */
+  ratingRecord: RatingRecord | null;
 }
 
 export interface LegalTarget {
@@ -68,10 +95,23 @@ export interface LegalTarget {
   promotion: boolean;
 }
 
+interface SavedClock {
+  controlId: string;
+  values: Record<Color, number>;
+  /** Clock values after each ply; index 0 is the start of the game. */
+  history: Record<Color, number>[];
+  flagged: Color | null;
+}
+
 interface SavedGame {
   pgn: string;
   playerColor: Color;
   annotations: (Annotation | null)[];
+  clock?: SavedClock;
+  rated?: boolean;
+  ratedElo?: number;
+  ratingRecord?: RatingRecord | null;
+  resigned?: Color | null;
 }
 
 const SAVE_KEY = "chess3d.game.v1";
@@ -116,6 +156,25 @@ function isAnnotation(value: unknown): value is Annotation {
   return MOVE_CLASSES.includes(v.cls as MoveClass) && isScore(v.before) && isScore(v.after);
 }
 
+function isClockValues(value: unknown): value is Record<Color, number> {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return Number.isFinite(v.w) && Number.isFinite(v.b) && (v.w as number) >= 0 && (v.b as number) >= 0;
+}
+
+function newClock(controlId: string): SavedClock {
+  const control = getTimeControl(controlId);
+  const start = control ? control.initialMs : 0;
+  const values = { w: start, b: start };
+  return { controlId: control ? controlId : "none", values, history: [{ ...values }], flagged: null };
+}
+
+/** True when `color` cannot possibly deliver mate: a bare king, or king and one minor piece. */
+function cannotMate(chess: Chess, color: Color): boolean {
+  const pieces = chess.board().flat().filter((p) => p && p.color === color && p.type !== "k");
+  return pieces.length === 0 || (pieces.length === 1 && (pieces[0]!.type === "b" || pieces[0]!.type === "n"));
+}
+
 function resolveColor(choice: PlayerColorChoice): Color {
   if (choice === "random") return Math.random() < 0.5 ? "w" : "b";
   return choice;
@@ -147,6 +206,16 @@ export class GameController {
     engineError: null as string | null,
   };
   private snapshot: GameSnapshot;
+  private clock: SavedClock = newClock("none");
+  private clockRunning: Color | null = null;
+  private clockSince = 0;
+  private flagTimer = 0;
+  private hidden = false;
+  private rated = false;
+  /** Engine strength when the rated game started; changing it mid-game makes the game unrated. */
+  private ratedElo = 0;
+  private ratingRecord: RatingRecord | null = null;
+  private resigned: Color | null = null;
 
   constructor() {
     this.restore();
@@ -162,6 +231,7 @@ export class GameController {
 
   private emit(positionChanged = false): void {
     if (positionChanged) this.positionId++;
+    this.syncClock();
     this.snapshot = this.build();
     this.listeners.forEach((l) => l());
   }
@@ -197,6 +267,8 @@ export class GameController {
       color: m.color,
       from: m.from,
       to: m.to,
+      before: m.before,
+      after: m.after,
       annotation: this.annotations[i] ?? null,
     }));
     return {
@@ -217,11 +289,26 @@ export class GameController {
       arrows: this.ui.arrows,
       feedback: this.ui.feedback,
       engineError: this.ui.engineError,
+      clock: {
+        controlId: this.clock.controlId,
+        limited: getTimeControl(this.clock.controlId) !== null,
+        values: { ...this.clock.values },
+        running: this.clockRunning,
+        since: this.clockSince,
+      },
+      rated: this.rated,
+      ratingRecord: this.ratingRecord,
     };
   }
 
   private status(): GameStatus {
     const c = this.chess;
+    if (this.resigned) return { kind: "resigned", winner: this.resigned === "w" ? "b" : "w" };
+    const flagged = this.clock.flagged;
+    if (flagged) {
+      const winner = flagged === "w" ? "b" : "w";
+      return cannotMate(c, winner) ? { kind: "draw", reason: "timeout vs insufficient material" } : { kind: "timeout", winner };
+    }
     if (c.isCheckmate()) return { kind: "checkmate", winner: c.turn() === "w" ? "b" : "w" };
     if (c.isStalemate()) return { kind: "draw", reason: "stalemate" };
     if (c.isInsufficientMaterial()) return { kind: "draw", reason: "insufficient material" };
@@ -240,17 +327,25 @@ export class GameController {
   }
 
   private isOver(): boolean {
-    return this.chess.isGameOver();
+    return this.resigned !== null || this.clock.flagged !== null || this.chess.isGameOver();
   }
 
-  /** Starts engines as needed. Safe to call again after dispose (React strict mode does this). */
+  /** Starts engines and clocks. Safe to call again after dispose (React strict mode does this). */
   start(): void {
     this.disposed = false;
+    this.hidden = document.hidden;
+    document.addEventListener("visibilitychange", this.onVisibility);
+    window.addEventListener("pagehide", this.onPageHide);
+    this.emit();
     this.advance();
   }
 
   dispose(): void {
     this.disposed = true;
+    document.removeEventListener("visibilitychange", this.onVisibility);
+    window.removeEventListener("pagehide", this.onPageHide);
+    this.syncClock();
+    this.save();
     this.token++;
     this.opponent?.terminate();
     this.coach?.terminate();
@@ -262,8 +357,103 @@ export class GameController {
     this.ui.hintPending = false;
   }
 
+  /** The clock pauses while the page is hidden; this is a game against the computer. */
+  private onVisibility = (): void => {
+    this.hidden = document.hidden;
+    this.emit();
+  };
+
+  private onPageHide = (): void => {
+    this.settleClock();
+    this.save();
+  };
+
+  /** Charges the time since the last settle to the running clock. */
+  private settleClock(): void {
+    const running = this.clockRunning;
+    if (!running) return;
+    const now = performance.now();
+    const elapsed = now - this.clockSince;
+    this.clockSince = now;
+    const limited = getTimeControl(this.clock.controlId) !== null;
+    this.clock.values[running] = limited
+      ? Math.max(0, this.clock.values[running] - elapsed)
+      : this.clock.values[running] + elapsed;
+  }
+
+  /**
+   * Runs the clock of the side to move, except while the game is over, the page is hidden,
+   * or the coach is reviewing (training pauses must not cost either player time).
+   */
+  private syncClock(): void {
+    const shouldRun =
+      !this.disposed && !this.hidden && !this.isOver() && !this.ui.reviewing && !this.ui.review ? this.chess.turn() : null;
+    if (shouldRun !== this.clockRunning) {
+      this.settleClock();
+      this.clockRunning = shouldRun;
+      this.clockSince = performance.now();
+    }
+    window.clearTimeout(this.flagTimer);
+    const running = this.clockRunning;
+    if (running && getTimeControl(this.clock.controlId)) {
+      const left = this.clock.values[running] - (performance.now() - this.clockSince);
+      this.flagTimer = window.setTimeout(this.checkFlag, Math.max(0, left) + 20);
+    }
+  }
+
+  private checkFlag = (): void => {
+    const running = this.clockRunning;
+    if (!running) return;
+    this.settleClock();
+    if (this.clock.values[running] > 0) {
+      this.syncClock();
+      return;
+    }
+    this.interrupt();
+    this.clock.flagged = running;
+    this.settleRating();
+    if (getSettings().sound) playSound("end");
+    this.save();
+    this.emit(true);
+  };
+
+  /** Time a player has left (or has used, without a time control), including the running stretch. */
+  private clockValue(color: Color): number {
+    const base = this.clock.values[color];
+    if (this.clockRunning !== color) return base;
+    const elapsed = performance.now() - this.clockSince;
+    return getTimeControl(this.clock.controlId) ? Math.max(0, base - elapsed) : base + elapsed;
+  }
+
+  /** Brings the clocks back to how they stood after the current ply, e.g. after undo. */
+  private rewindClock(): void {
+    const plies = this.chess.history().length;
+    this.clockRunning = null;
+    this.clock.flagged = null;
+    this.clock.history.length = Math.min(this.clock.history.length, plies + 1);
+    const at = this.clock.history[plies] ?? this.clock.history.at(-1)!;
+    this.clock.values = { ...at };
+  }
+
+  /** Keeps the engine within its own clock: about a thirtieth of what is left, plus most of the increment. */
+  private budgetGo(go: string): string {
+    const control = getTimeControl(this.clock.controlId);
+    if (!control) return go;
+    const left = this.clockValue(this.chess.turn());
+    const budget = Math.round(Math.max(50, Math.min(left / 30 + control.incrementMs * 0.8, left * 0.5)));
+    const movetime = /movetime (\d+)/.exec(go);
+    if (movetime) return go.replace(movetime[0], `movetime ${Math.min(Number(movetime[1]), budget)}`);
+    return `${go} movetime ${budget}`;
+  }
+
   /** Re-evaluates what should happen next, e.g. after a settings change. */
   refresh(): void {
+    const s = getSettings();
+    if (this.rated && !this.isOver() && (s.mode !== "play" || s.elo !== this.ratedElo)) {
+      this.rated = false;
+      this.save();
+      this.emit();
+    }
     if (getSettings().mode === "play" && this.ui.review) {
       this.ui.review = null;
       this.ui.arrows = [];
@@ -356,6 +546,30 @@ export class GameController {
       !this.ui.reviewing &&
       !this.ui.review
     );
+  }
+
+  /**
+   * Reads a typed move in SAN ("Nf3", "exd5", "e8=Q") or coordinates ("g1f3", "e7e8q").
+   * Returns null when it is not legal here, or when a promotion piece is missing.
+   */
+  parseMove(text: string): { from: Square; to: Square; promotion?: PieceSymbol } | null {
+    const input = text.trim();
+    if (!input) return null;
+    const coords = /^([a-h][1-8])-?([a-h][1-8])([qrbn])?$/i.exec(input);
+    const legal = this.chess.moves({ verbose: true });
+    if (coords) {
+      const [, from, to, promo] = coords;
+      const move = legal.find(
+        (m) => m.from === from.toLowerCase() && m.to === to.toLowerCase() && m.promotion === promo?.toLowerCase(),
+      );
+      return move ? { from: move.from, to: move.to, promotion: move.promotion } : null;
+    }
+    try {
+      const move = new Chess(this.chess.fen()).move(input, { strict: false });
+      return { from: move.from, to: move.to, promotion: move.promotion };
+    } catch {
+      return null;
+    }
   }
 
   pieceAt(square: Square): { type: PieceSymbol; color: Color } | null {
@@ -467,7 +681,7 @@ export class GameController {
     try {
       const engine = this.getOpponent();
       await engine.configure(profile.options);
-      uci = (await engine.search(fen, profile.go)).bestMove;
+      uci = (await engine.search(fen, this.budgetGo(profile.go))).bestMove;
     } catch (e) {
       if (token === this.token) this.fail(e as Error);
       return;
@@ -479,7 +693,11 @@ export class GameController {
       const pick = moves[Math.floor(Math.random() * moves.length)];
       if (pick) uci = moveToUci(pick);
     }
-    const wait = MIN_REPLY_MS - (performance.now() - startedAt);
+    // The short pause that makes instant replies feel natural must not cost a low clock much.
+    const pause = getTimeControl(this.clock.controlId)
+      ? Math.min(MIN_REPLY_MS, this.clockValue(this.chess.turn()) / 50)
+      : MIN_REPLY_MS;
+    const wait = pause - (performance.now() - startedAt);
     if (wait > 0) await sleep(wait);
     if (token !== this.token || !uci) return;
 
@@ -499,7 +717,47 @@ export class GameController {
     this.advance();
   }
 
+  private playerHasMoved(): boolean {
+    return this.chess.history({ verbose: true }).some((m) => m.color === this.playerColor);
+  }
+
+  /** Whether starting another game now would count as a loss. */
+  isRatedInProgress(): boolean {
+    return this.rated && !this.isOver() && this.playerHasMoved();
+  }
+
+  /** Records the result of a finished rated game, once. */
+  private settleRating(): void {
+    if (!this.rated || this.ratingRecord || !this.isOver()) return;
+    const s = this.status();
+    let result: GameResult = 0.5;
+    if (s.kind === "checkmate" || s.kind === "timeout" || s.kind === "resigned") {
+      result = s.winner === this.playerColor ? 1 : 0;
+    }
+    this.ratingRecord = recordResult(this.ratedElo, result);
+  }
+
+  resign(): void {
+    if (this.isOver()) return;
+    this.settleClock();
+    this.interrupt();
+    this.resigned = this.playerColor;
+    this.settleRating();
+    if (getSettings().sound) playSound("end");
+    this.save();
+    this.emit(true);
+  }
+
   private onMoved(move: Move): void {
+    // The mover's clock was running; charge it, add the increment and record the result.
+    this.settleClock();
+    const control = getTimeControl(this.clock.controlId);
+    // A move completed after the flag fell does not save the player, even with an increment.
+    if (control && this.clock.values[move.color] <= 0) this.clock.flagged = move.color;
+    else if (control) this.clock.values[move.color] += control.incrementMs;
+    this.clock.history[this.chess.history().length] = { ...this.clock.values };
+    this.clock.history.length = this.chess.history().length + 1;
+    this.settleRating();
     if (getSettings().sound) {
       if (this.isOver()) playSound("end");
       else if (this.chess.inCheck()) playSound("check");
@@ -513,9 +771,11 @@ export class GameController {
   /** Training: take the reviewed move back and let the player find a better one. */
   retry(): void {
     if (!this.ui.review) return;
+    this.rated = false;
     this.token++;
     this.chess.undo();
     this.annotations.length = this.chess.history().length;
+    this.rewindClock();
     this.ui.review = null;
     this.ui.arrows = [];
     this.ui.animate = null;
@@ -560,6 +820,8 @@ export class GameController {
 
   async hint(): Promise<void> {
     if (!this.canMove() || this.ui.hintPending) return;
+    this.rated = false;
+    this.save();
     const token = this.token;
     const fen = this.chess.fen();
     this.ui.hintPending = true;
@@ -589,20 +851,35 @@ export class GameController {
   /** Takes back moves until it is the player's turn again, removing at least one of their moves. */
   undo(): void {
     if (this.chess.history().length === 0) return;
+    this.settleClock();
+    this.rated = false;
+    this.resigned = null;
+    // The result stays in the rating history; this game simply no longer shows it.
+    this.ratingRecord = null;
     this.interrupt();
     do {
       this.chess.undo();
     } while (this.chess.history().length > 0 && this.chess.turn() !== this.playerColor);
     this.annotations.length = this.chess.history().length;
+    this.rewindClock();
     this.save();
     this.emit(true);
     this.advance();
   }
 
-  newGame(choice: PlayerColorChoice): void {
+  newGame(choice: PlayerColorChoice, timeControl = getSettings().timeControl): void {
+    // Leaving a rated game in progress counts as a loss, as it does online.
+    if (this.isRatedInProgress()) recordResult(this.ratedElo, 0);
+    const settings = getSettings();
+    this.rated = settings.mode === "play";
+    this.ratedElo = settings.elo;
+    this.ratingRecord = null;
+    this.resigned = null;
     this.interrupt();
     this.chess.reset();
     this.annotations = [];
+    this.clock = newClock(timeControl);
+    this.clockRunning = null;
     this.playerColor = resolveColor(choice);
     this.ui.evaluation = null;
     this.analysisCache.clear();
@@ -638,6 +915,14 @@ export class GameController {
       pgn: this.chess.pgn(),
       playerColor: this.playerColor,
       annotations: this.annotations,
+      clock: {
+        ...this.clock,
+        values: { w: this.clockValue("w"), b: this.clockValue("b") },
+      },
+      rated: this.rated,
+      ratedElo: this.ratedElo,
+      ratingRecord: this.ratingRecord,
+      resigned: this.resigned,
     };
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(data));
@@ -648,6 +933,9 @@ export class GameController {
 
   private restore(): void {
     this.playerColor = resolveColor(getSettings().playerColor);
+    this.clock = newClock(getSettings().timeControl);
+    this.rated = getSettings().mode === "play";
+    this.ratedElo = getSettings().elo;
     try {
       const raw = localStorage.getItem(SAVE_KEY);
       if (!raw) return;
@@ -658,9 +946,27 @@ export class GameController {
       const plies = this.chess.history().length;
       const saved = Array.isArray(data.annotations) ? data.annotations : [];
       this.annotations = Array.from({ length: plies }, (_, i) => (isAnnotation(saved[i]) ? saved[i] : null));
+      this.clock = this.restoreClock(data.clock, plies);
+      this.rated = data.rated === true && typeof data.ratedElo === "number";
+      this.ratedElo = typeof data.ratedElo === "number" ? data.ratedElo : 0;
+      this.ratingRecord = data.ratingRecord ?? null;
+      this.resigned = data.resigned === "w" || data.resigned === "b" ? data.resigned : null;
     } catch {
       this.chess.reset();
       this.annotations = [];
+      this.clock = newClock(getSettings().timeControl);
     }
+  }
+
+  private restoreClock(saved: SavedClock | undefined, plies: number): SavedClock {
+    if (!saved || !TIME_CONTROL_IDS.includes(saved.controlId) || !isClockValues(saved.values)) return newClock("none");
+    const history = Array.isArray(saved.history) ? saved.history.filter(isClockValues) : [];
+    const fresh = newClock(saved.controlId);
+    return {
+      controlId: saved.controlId,
+      values: { ...saved.values },
+      history: history.length === plies + 1 ? history : [...fresh.history],
+      flagged: saved.flagged === "w" || saved.flagged === "b" ? saved.flagged : null,
+    };
   }
 }

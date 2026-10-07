@@ -1,4 +1,7 @@
 import * as THREE from "three/webgpu";
+import { float, mix, mrt, normalView, output, packNormalToRGB, pass, renderOutput, sample, select, uniform, unpackRGBToNormal, vec4 } from "three/tsl";
+import { fxaa } from "three/addons/tsl/display/FXAANode.js";
+import { ao } from "three/addons/tsl/display/GTAONode.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
@@ -7,6 +10,7 @@ import type { Arrow } from "../game";
 import type { Quality } from "../settings";
 import type { Theme } from "../themes";
 import { createPieceGeometries } from "./pieces";
+import { createBoardTexture, createFrameTexture, createPieceMaterial } from "./textures";
 
 export interface Highlights {
   selected: Square | null;
@@ -14,6 +18,8 @@ export interface Highlights {
   lastMove: { from: Square; to: Square } | null;
   check: Square | null;
   arrows: Arrow[];
+  /** Keyboard cursor; null when the board is driven by pointer or touch. */
+  cursor: Square | null;
 }
 
 interface PieceObj {
@@ -35,7 +41,6 @@ interface Tween {
 }
 
 const FILES = "abcdefgh";
-const SQUARE_COUNT = 64;
 const BOARD_TOP = 0.03;
 const FRAME = 9.1;
 const OVERLAY_Y = BOARD_TOP + 0.002;
@@ -51,8 +56,11 @@ function squareToXZ(square: Square): { x: number; z: number } {
   return { x: file - 3.5, z: 3.5 - rank };
 }
 
-function indexToSquare(i: number): Square {
-  return `${FILES[i % 8]}${Math.floor(i / 8) + 1}` as Square;
+function pointToSquare(x: number, z: number): Square | null {
+  const file = Math.floor(x + 4);
+  const rank = Math.floor(4 - z);
+  if (file < 0 || file > 7 || rank < 0 || rank > 7) return null;
+  return `${FILES[file]}${rank + 1}` as Square;
 }
 
 function parsePlacement(fen: string): Map<Square, { type: PieceSymbol; color: Color }> {
@@ -104,9 +112,15 @@ export class BoardScene {
   onTap: (square: Square | null) => void = () => {};
   /** Lets the scene show a pointer cursor over squares that accept a tap. */
   isInteractive: (square: Square) => boolean = () => false;
+  /** Fires when the camera leaves or returns to the default view. */
+  onViewChange: (adjusted: boolean) => void = () => {};
 
   private container: HTMLElement;
   private renderer!: THREE.WebGPURenderer;
+  /** Scene pass plus ambient occlusion; used on High quality only. */
+  private pipeline: THREE.RenderPipeline | null = null;
+  /** Page background in display (sRGB) values, composited behind the board by the pipeline. */
+  private backdrop = uniform(new THREE.Color(1, 1, 1));
   private scene = new THREE.Scene();
   private camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
   private controls!: OrbitControls;
@@ -117,7 +131,11 @@ export class BoardScene {
   private geometries = createPieceGeometries();
   private pieceMaterials: Record<Color, THREE.MeshPhysicalMaterial>;
   private frameMaterial = new THREE.MeshStandardMaterial({ roughness: 0.7 });
-  private squares: THREE.InstancedMesh;
+  private boardMaterial = new THREE.MeshStandardMaterial({ roughness: 0.6 });
+  private boardTop = new THREE.Mesh(new THREE.BoxGeometry(8, BOARD_TOP, 8), this.boardMaterial);
+  private quality: Quality = "high";
+  /** Theme and quality the current textures were built for, to skip identical rebuilds. */
+  private finishKey = "";
   private labelCanvas = document.createElement("canvas");
   private labelTexture: THREE.CanvasTexture;
   private pieces = new Map<Square, PieceObj>();
@@ -144,6 +162,7 @@ export class BoardScene {
     dots: [] as THREE.Mesh[],
     rings: [] as THREE.Mesh[],
     arrows: new THREE.Group(),
+    cursor: null as unknown as THREE.Mesh,
   };
 
   private constructor(container: HTMLElement, theme: Theme) {
@@ -158,8 +177,6 @@ export class BoardScene {
       b: new THREE.MeshPhysicalMaterial({ roughness: 0.38, clearcoat: 0.8, clearcoatRoughness: 0.22 }),
     };
 
-    const tile = new THREE.BoxGeometry(1, BOARD_TOP, 1);
-    this.squares = new THREE.InstancedMesh(tile, new THREE.MeshStandardMaterial({ roughness: 0.62 }), SQUARE_COUNT);
     this.labelTexture = new THREE.CanvasTexture(this.labelCanvas);
     this.labelTexture.colorSpace = THREE.SRGBColorSpace;
     this.labelTexture.anisotropy = 4;
@@ -195,7 +212,7 @@ export class BoardScene {
     try {
       const pmrem = new THREE.PMREMGenerator(renderer);
       this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-      this.scene.environmentIntensity = 0.55;
+      this.scene.environmentIntensity = 0.35;
       pmrem.dispose();
     } catch {
       // Lights alone still give a clean look if the environment cannot be baked.
@@ -205,6 +222,7 @@ export class BoardScene {
     this.buildBoard();
     this.buildOverlays();
     this.buildControls();
+    this.quality = quality;
     this.setTheme(this.theme);
     this.setQuality(quality);
 
@@ -219,10 +237,12 @@ export class BoardScene {
   }
 
   private buildLights(): void {
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x8f887c, 0.9));
+    // A modest fill keeps shadows readable; most of the shape comes from the key light and the
+    // environment, which is what separates overlapping light pieces.
+    this.scene.add(new THREE.HemisphereLight(0xfff8ee, 0x5f584e, 0.38));
 
-    const key = new THREE.DirectionalLight(0xffffff, 2.0);
-    key.position.set(-4, 11, 6);
+    const key = new THREE.DirectionalLight(0xfff4e6, 2.7);
+    key.position.set(-5, 10, 5);
     key.castShadow = true;
     key.shadow.mapSize.set(2048, 2048);
     const cam = key.shadow.camera;
@@ -238,8 +258,8 @@ export class BoardScene {
     this.keyLight = key;
     this.scene.add(key);
 
-    const rim = new THREE.DirectionalLight(0xffffff, 0.6);
-    rim.position.set(6, 6, -7);
+    const rim = new THREE.DirectionalLight(0xdfe8ff, 0.9);
+    rim.position.set(6, 5, -7);
     this.scene.add(rim);
   }
 
@@ -262,14 +282,9 @@ export class BoardScene {
     labels.position.y = 0.003;
     this.scene.add(labels);
 
-    const m = new THREE.Matrix4();
-    for (let i = 0; i < SQUARE_COUNT; i++) {
-      const { x, z } = squareToXZ(indexToSquare(i));
-      m.makeTranslation(x, BOARD_TOP / 2, z);
-      this.squares.setMatrixAt(i, m);
-    }
-    this.squares.receiveShadow = true;
-    this.scene.add(this.squares);
+    this.boardTop.position.y = BOARD_TOP / 2;
+    this.boardTop.receiveShadow = true;
+    this.scene.add(this.boardTop);
   }
 
   private buildOverlays(): void {
@@ -281,6 +296,23 @@ export class BoardScene {
     }
     this.overlays.selected = flatPlane(unit, overlayMaterial("#f0c24b", 0.62));
     this.scene.add(this.overlays.selected);
+
+    const frame = new THREE.Shape();
+    frame.moveTo(-0.49, -0.49);
+    frame.lineTo(0.49, -0.49);
+    frame.lineTo(0.49, 0.49);
+    frame.lineTo(-0.49, 0.49);
+    frame.closePath();
+    const hole = new THREE.Path();
+    hole.moveTo(-0.41, -0.41);
+    hole.lineTo(-0.41, 0.41);
+    hole.lineTo(0.41, 0.41);
+    hole.lineTo(0.41, -0.41);
+    hole.closePath();
+    frame.holes.push(hole);
+    this.overlays.cursor = flatPlane(new THREE.ShapeGeometry(frame), overlayMaterial(this.theme.ui.focus, 0.95));
+    this.overlays.cursor.renderOrder = 3;
+    this.scene.add(this.overlays.cursor);
 
     const glow = document.createElement("canvas");
     glow.width = glow.height = 128;
@@ -365,26 +397,63 @@ export class BoardScene {
   setTheme(theme: Theme): void {
     this.theme = theme;
     if (!this.renderer) return;
-    const light = new THREE.Color(theme.board.light);
-    const dark = new THREE.Color(theme.board.dark);
-    for (let i = 0; i < SQUARE_COUNT; i++) {
-      const file = i % 8;
-      const rank = Math.floor(i / 8);
-      this.squares.setColorAt(i, (file + rank) % 2 === 0 ? dark : light);
-    }
-    this.squares.instanceColor!.needsUpdate = true;
-    this.frameMaterial.color.set(theme.board.frame);
-    this.pieceMaterials.w.color.set(theme.pieces.white);
-    this.pieceMaterials.b.color.set(theme.pieces.black);
+    this.applyFinish();
+    // Store the sRGB numbers as-is: the pipeline composites after its own colour conversion.
+    const bg = new THREE.Color(theme.ui.bg).convertLinearToSRGB();
+    this.backdrop.value.setRGB(bg.r, bg.g, bg.b, THREE.LinearSRGBColorSpace);
+    (this.overlays.cursor.material as THREE.MeshBasicMaterial).color.set(theme.ui.focus);
     this.drawLabels();
     this.dirty = true;
   }
 
+  /** Rebuilds the board surface, frame and piece materials for the theme's finish. */
+  private applyFinish(): void {
+    const t = this.theme;
+    const key = `${t.id}:${this.quality}`;
+    if (key === this.finishKey) return;
+    this.finishKey = key;
+    const high = this.quality === "high";
+    const boardFinish = t.finish.board;
+
+    const oldBoard = this.boardMaterial.map;
+    this.boardMaterial.map = createBoardTexture(boardFinish, t.board.light, t.board.dark, high ? 2048 : 1024);
+    this.boardMaterial.roughness = boardFinish === "stone" ? 0.78 : boardFinish === "wood" ? 0.55 : 0.6;
+    this.boardMaterial.needsUpdate = true;
+    oldBoard?.dispose();
+
+    const oldFrame = this.frameMaterial.map;
+    this.frameMaterial.map = createFrameTexture(boardFinish, t.board.frame, high ? 1024 : 512);
+    this.frameMaterial.color.set("#ffffff");
+    this.frameMaterial.needsUpdate = true;
+    oldFrame?.dispose();
+
+    const old = this.pieceMaterials;
+    const size = high ? 512 : 256;
+    this.pieceMaterials = {
+      w: createPieceMaterial(t.finish.pieces, t.pieces.white, size, 3),
+      b: createPieceMaterial(t.finish.pieces, t.pieces.black, size, 5),
+    };
+    for (const obj of this.pieces.values()) obj.mesh.material = this.pieceMaterials[obj.color];
+    for (const m of Object.values(old)) {
+      m.map?.dispose();
+      m.dispose();
+    }
+  }
+
   setQuality(quality: Quality): void {
     if (!this.renderer) return;
+    if (quality !== this.quality) {
+      this.quality = quality;
+      this.applyFinish();
+    }
     const dpr = window.devicePixelRatio || 1;
     this.renderer.setPixelRatio(quality === "high" ? Math.min(dpr, 2) : Math.min(dpr, 1.25));
     this.keyLight.castShadow = quality === "high";
+    if (quality === "high" && !this.pipeline) this.pipeline = this.buildPipeline();
+    if (quality !== "high" && this.pipeline) {
+      this.pipeline.dispose();
+      this.pipeline = null;
+    }
     this.resize();
   }
 
@@ -399,6 +468,36 @@ export class BoardScene {
 
   resetView(): void {
     this.placeCamera(this.side, true);
+  }
+
+  /** Turns the camera to the opposite side of the board, without changing whose side it is. */
+  flipView(): void {
+    if (!this.renderer) return;
+    const s = new THREE.Spherical().setFromVector3(this.camera.position);
+    this.animateCamera(s.radius, s.phi, s.theta + Math.PI);
+    this.setAdjusted(true);
+  }
+
+  orbitBy(azimuth: number, polar: number): void {
+    if (!this.renderer || this.cameraTween) return;
+    const s = new THREE.Spherical().setFromVector3(this.camera.position);
+    s.theta += azimuth;
+    s.phi = THREE.MathUtils.clamp(s.phi + polar, this.controls.minPolarAngle, this.controls.maxPolarAngle);
+    this.camera.position.setFromSpherical(s);
+    this.camera.lookAt(0, 0, 0);
+    this.controls.update();
+    this.setAdjusted(true);
+    this.dirty = true;
+  }
+
+  zoomBy(factor: number): void {
+    if (!this.renderer || this.cameraTween) return;
+    const s = new THREE.Spherical().setFromVector3(this.camera.position);
+    s.radius = THREE.MathUtils.clamp(s.radius * factor, this.controls.minDistance, this.controls.maxDistance);
+    this.camera.position.setFromSpherical(s);
+    this.controls.update();
+    this.setAdjusted(true);
+    this.dirty = true;
   }
 
   /**
@@ -425,7 +524,12 @@ export class BoardScene {
       }
     }
 
-    const move = (obj: PieceObj, from: Square, to: Square, promoteTo?: PieceSymbol) => {
+    const move = (obj: PieceObj, from: Square, to: Square, becomes?: PieceSymbol, changeFirst = false) => {
+      // Undoing a promotion turns the piece back into a pawn before it slides home.
+      if (changeFirst && becomes) {
+        obj.type = becomes;
+        obj.mesh.geometry = this.geometries[becomes];
+      }
       const a = squareToXZ(from);
       const b = squareToXZ(to);
       const dist = Math.hypot(b.x - a.x, b.z - a.z);
@@ -440,9 +544,9 @@ export class BoardScene {
           obj.holder.position.set(a.x + (b.x - a.x) * e, BOARD_TOP + Math.sin(Math.PI * t) * lift, a.z + (b.z - a.z) * e);
         },
         done: () => {
-          if (promoteTo && promoteTo !== obj.type) {
-            obj.type = promoteTo;
-            obj.mesh.geometry = this.geometries[promoteTo];
+          if (becomes && becomes !== obj.type) {
+            obj.type = becomes;
+            obj.mesh.geometry = this.geometries[becomes];
           }
         },
       });
@@ -473,10 +577,13 @@ export class BoardScene {
           best = sq;
         }
       }
+      const demote = !best && p.type === "p";
+      if (demote) best = this.promotedPieceFor(square, p.color, remaining);
       if (best) {
         const obj = remaining.get(best)!;
         remaining.delete(best);
-        move(obj, best, square);
+        if (demote) move(obj, best, square, "p", true);
+        else move(obj, best, square);
         next.set(square, obj);
       } else {
         next.set(square, this.spawn(square, p.type, p.color, now));
@@ -516,6 +623,7 @@ export class BoardScene {
     place(o.last[1], h.lastMove?.to ?? null);
     place(o.selected, h.selected, OVERLAY_Y + 0.001);
     place(o.check, h.check, OVERLAY_Y + 0.002);
+    place(o.cursor, h.cursor, OVERLAY_Y + 0.004);
 
     let d = 0;
     let r = 0;
@@ -549,6 +657,7 @@ export class BoardScene {
     this.canvas.removeEventListener("wheel", this.handleWheel);
     if (this.renderer) {
       this.renderer.setAnimationLoop(null);
+      this.pipeline?.dispose();
       this.controls?.dispose();
       this.scene.traverse((obj) => {
         if (obj instanceof THREE.Mesh) {
@@ -561,13 +670,34 @@ export class BoardScene {
         }
       });
       Object.values(this.geometries).forEach((g) => g.dispose());
-      Object.values(this.pieceMaterials).forEach((m) => m.dispose());
-      this.squares.dispose();
+      Object.values(this.pieceMaterials).forEach((m) => {
+        m.map?.dispose();
+        m.dispose();
+      });
       this.keyLight?.shadow.dispose();
       this.scene.environment?.dispose();
       this.renderer.dispose();
     }
     this.canvas.remove();
+  }
+
+  /** A promoted piece standing just above `pawnSquare`, which an undo should turn back into a pawn. */
+  private promotedPieceFor(pawnSquare: Square, color: Color, remaining: Map<Square, PieceObj>): Square | null {
+    const pawnRank = color === "w" ? "7" : "2";
+    const backRank = color === "w" ? "8" : "1";
+    if (pawnSquare[1] !== pawnRank) return null;
+    const file = FILES.indexOf(pawnSquare[0]);
+    for (const [sq, obj] of remaining) {
+      if (obj.color !== color || obj.type === "p" || obj.type === "k" || sq[1] !== backRank) continue;
+      if (Math.abs(FILES.indexOf(sq[0]) - file) <= 1) return sq;
+    }
+    return null;
+  }
+
+  private setAdjusted(adjusted: boolean): void {
+    if (adjusted === this.userAdjusted) return;
+    this.userAdjusted = adjusted;
+    this.onViewChange(adjusted);
   }
 
   private spawn(square: Square, type: PieceSymbol, color: Color, now: number): PieceObj {
@@ -648,6 +778,34 @@ export class BoardScene {
     });
   }
 
+  /** Ambient occlusion darkens the contact between pieces and the board, and between pieces. */
+  private buildPipeline(): THREE.RenderPipeline | null {
+    try {
+      const pipeline = new THREE.RenderPipeline(this.renderer);
+      // Ambient occlusion reads depth, which cannot be multisampled; FXAA smooths edges instead.
+      const scenePass = pass(this.scene, this.camera, { samples: 0 });
+      scenePass.setMRT(mrt({ output, normal: packNormalToRGB(normalView) }));
+      scenePass.getTexture("normal").type = THREE.UnsignedByteType;
+      const color = scenePass.getTextureNode("output");
+      const normals = scenePass.getTextureNode("normal");
+      const normal = sample((uv) => unpackRGBToNormal(normals.sample(uv)));
+      const occlusion = ao(scenePass.getTextureNode("depth"), normal, this.camera);
+      occlusion.resolutionScale = 0.5;
+      occlusion.radius.value = 0.5;
+      occlusion.thickness.value = 1;
+      const strength = occlusion.getTextureNode().r.mul(0.9).add(0.1);
+      pipeline.outputColorTransform = false;
+      const graded = renderOutput(vec4(color.rgb.mul(strength), color.a));
+      // The pass output is opaque, so the page colour is composited where nothing was drawn
+      // (depth still at the far plane). FXAA then smooths the board's edge against it.
+      const coverage = select(scenePass.getTextureNode("depth").x.lessThan(0.99999), float(1), float(0));
+      pipeline.outputNode = fxaa(vec4(mix(this.backdrop, graded.rgb, coverage), 1));
+      return pipeline;
+    } catch {
+      return null;
+    }
+  }
+
   private flushTweens(): void {
     const pending = this.tweens;
     this.tweens = pending.filter((tw) => tw.keep);
@@ -683,7 +841,8 @@ export class BoardScene {
     const animating = this.runTweens(now);
     const moved = this.cameraTween ? false : this.controls.update();
     if (animating || moved || this.dirty || this.cameraTween) {
-      this.renderer.render(this.scene, this.camera);
+      if (this.pipeline) this.pipeline.render();
+      else this.renderer.render(this.scene, this.camera);
       this.dirty = false;
     }
   };
@@ -770,7 +929,7 @@ export class BoardScene {
   }
 
   private placeCamera(side: Color, animate: boolean): void {
-    this.userAdjusted = false;
+    this.setAdjusted(false);
     const polar = this.defaultPolar();
     const azimuth = side === "w" ? 0 : Math.PI;
     const { dist, shift } = this.frameBoard(polar, azimuth);
@@ -785,6 +944,10 @@ export class BoardScene {
       this.dirty = true;
       return;
     }
+    this.animateCamera(dist, polar, azimuth);
+  }
+
+  private animateCamera(radius: number, polar: number, azimuth: number): void {
     const from = new THREE.Spherical().setFromVector3(this.camera.position);
     let dTheta = azimuth - from.theta;
     // Rotate the short way round, but flip sides by turning around the board.
@@ -801,7 +964,7 @@ export class BoardScene {
       step: (t) => {
         const e = easeInOut(t);
         this.camera.position.setFromSphericalCoords(
-          from.radius + (dist - from.radius) * e,
+          from.radius + (radius - from.radius) * e,
           from.phi + (polar - from.phi) * e,
           from.theta + dTheta * e,
         );
@@ -821,11 +984,11 @@ export class BoardScene {
     this.raycaster.setFromCamera(this.ndc, this.camera);
     const targets = this.pickTargets;
     targets.length = 0;
-    targets.push(this.squares);
+    targets.push(this.boardTop);
     for (const p of this.pieces.values()) targets.push(p.mesh);
     const hit = this.raycaster.intersectObjects(targets, false)[0];
     if (!hit) return null;
-    if (hit.object === this.squares && hit.instanceId !== undefined) return indexToSquare(hit.instanceId);
+    if (hit.object === this.boardTop) return pointToSquare(hit.point.x, hit.point.z);
     return (hit.object.userData.square as Square) ?? null;
   }
 
@@ -841,7 +1004,7 @@ export class BoardScene {
     const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
     // A drag rotates the camera; only a short, still press counts as a tap.
     if (moved > 8) {
-      this.userAdjusted = true;
+      this.setAdjusted(true);
       return;
     }
     if (performance.now() - down.t > 700) return;
@@ -849,7 +1012,7 @@ export class BoardScene {
   };
 
   private handleWheel = (): void => {
-    this.userAdjusted = true;
+    this.setAdjusted(true);
   };
 
   private handlePointerMove = (e: PointerEvent): void => {

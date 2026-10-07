@@ -14,6 +14,8 @@ export interface Analysis {
 type EngineOption = string | number | boolean;
 
 const ENGINE_URL = "/engine/stockfish.js";
+/** Covers downloading the WASM binary on a slow mobile connection. */
+const HANDSHAKE_TIMEOUT_MS = 60_000;
 
 /**
  * Thin UCI client around Stockfish running in a Web Worker.
@@ -75,7 +77,20 @@ export class Engine {
   private async handshake(): Promise<void> {
     const uciok = this.waitFor((l) => l === "uciok");
     this.send("uci");
-    await uciok;
+    let timer = 0;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = window.setTimeout(() => {
+        const error = new Error("The chess engine did not respond");
+        this.failed = error;
+        this.errorListeners.forEach((l) => l(error));
+        reject(error);
+      }, HANDSHAKE_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([uciok, timeout]);
+    } finally {
+      window.clearTimeout(timer);
+    }
     await this.sync();
   }
 

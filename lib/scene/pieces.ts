@@ -45,9 +45,26 @@ function merge(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
     return flat;
   });
   const merged = mergeGeometries(prepared, false);
+  bakeContactShade(merged);
   merged.computeBoundingBox();
   merged.computeBoundingSphere();
   return merged;
+}
+
+/**
+ * Darkens each piece towards its base, like light occluded by the board and its neighbours.
+ * This keeps overlapping light pieces readable: a pawn's dark foot stands out against the bright
+ * body of the piece behind it.
+ */
+function bakeContactShade(geometry: THREE.BufferGeometry): void {
+  const position = geometry.getAttribute("position");
+  const colors = new Float32Array(position.count * 3);
+  for (let i = 0; i < position.count; i++) {
+    const t = THREE.MathUtils.smoothstep(position.getY(i), 0, 0.34);
+    const shade = 0.6 + 0.4 * t;
+    colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = shade;
+  }
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 }
 
 function pawn(): THREE.BufferGeometry {

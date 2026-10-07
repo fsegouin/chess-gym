@@ -44,10 +44,36 @@ export const IconHint = () => (
   </Icon>
 );
 
-export const IconCamera = () => (
+export const IconResetView = () => (
   <Icon>
     <path d="M3 12a9 9 0 1 0 3-6.7" />
     <path d="M3 4v5h5" />
+  </Icon>
+);
+
+export const IconKeyboard = () => (
+  <Icon>
+    <rect x="2.5" y="6" width="19" height="12" rx="2" />
+    <path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7 14h10" />
+  </Icon>
+);
+
+export const IconFlag = () => (
+  <Icon>
+    <path d="M5 21V4" />
+    <path d="M5 4h11l-2 4 2 4H5" />
+  </Icon>
+);
+
+export const IconChevronLeft = () => (
+  <Icon>
+    <path d="m15 18-6-6 6-6" />
+  </Icon>
+);
+
+export const IconChevronRight = () => (
+  <Icon>
+    <path d="m9 18 6-6-6-6" />
   </Icon>
 );
 

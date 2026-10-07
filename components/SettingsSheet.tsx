@@ -9,13 +9,71 @@ import {
   updateSettings,
   type Settings,
 } from "@/lib/settings";
+import { useState } from "react";
+import { PROVISIONAL_GAMES, resetRating, useRating } from "@/lib/rating";
 import { THEME_CHOICES, THEMES } from "@/lib/themes";
-import { Dialog, Segmented, Toggle } from "./ui";
+import { TimeControlSelect } from "./TimeControlSelect";
+import { Dialog, rovingKeyDown, Segmented, Toggle } from "./ui";
 
 interface Props {
   settings: Settings;
   backend: string | null;
   onClose: () => void;
+}
+
+function RatingSection() {
+  const r = useRating();
+  const [confirming, setConfirming] = useState(false);
+  const provisional = r.games < PROVISIONAL_GAMES;
+  return (
+    <section className="settings-section">
+      <h3>Your rating</h3>
+      <div className="rating-summary">
+        <span className="rating-value">
+          {r.rating}
+          {provisional && <span className="rating-provisional">?</span>}
+        </span>
+        <span className="muted small">
+          {r.games} rated {r.games === 1 ? "game" : "games"} · {r.wins} won · {r.draws} drawn · {r.losses} lost
+          {provisional && ` · provisional until ${PROVISIONAL_GAMES} games`}
+        </span>
+      </div>
+      {r.history.length > 0 && (
+        <ol className="rating-history" aria-label="Recent rated games">
+          {r.history.slice(0, 5).map((h, i) => (
+            <li key={`${h.at}-${i}`}>
+              <span>{h.result === 1 ? "Won" : h.result === 0 ? "Lost" : "Drew"} vs {h.opponent}</span>
+              <span className={h.change >= 0 ? "tone-best" : "tone-threat"}>
+                {h.change >= 0 ? "+" : ""}
+                {h.change}
+              </span>
+              <span className="muted">{h.rating}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+      <small className="muted">
+        Games in Play mode count, against the engine strength above, unless you undo, ask for a hint or
+        change the strength mid-game. Your rating is stored on this device only.
+      </small>
+      <div>
+        {confirming ? (
+          <span className="confirm-row">
+            <button type="button" className="btn btn-danger" onClick={() => (resetRating(), setConfirming(false))}>
+              Reset to 1200
+            </button>
+            <button type="button" className="btn btn-ghost" onClick={() => setConfirming(false)}>
+              Keep it
+            </button>
+          </span>
+        ) : (
+          <button type="button" className="btn" onClick={() => setConfirming(true)} disabled={r.games === 0}>
+            Reset rating
+          </button>
+        )}
+      </div>
+    </section>
+  );
 }
 
 export function SettingsSheet({ settings, backend, onClose }: Props) {
@@ -91,6 +149,7 @@ export function SettingsSheet({ settings, backend, onClose }: Props) {
           <Segmented
             label="Pause the game on"
             wide
+            disabled={s.mode === "play"}
             value={s.pauseOn}
             onChange={(pauseOn) => updateSettings({ pauseOn })}
             options={[
@@ -102,15 +161,23 @@ export function SettingsSheet({ settings, backend, onClose }: Props) {
         </div>
         <Toggle
           label="Evaluation bar"
-          description="Shows who is better, in training mode"
+          description="Shows who is ahead, in pawns (M3 is mate in 3), in training mode"
           checked={s.showEvalBar}
           onChange={(showEvalBar) => updateSettings({ showEvalBar })}
         />
       </section>
 
       <section className="settings-section">
+        <h3>Clock</h3>
+        <TimeControlSelect value={s.timeControl} onChange={(timeControl) => updateSettings({ timeControl })} />
+        <small className="muted">Applies from the next game.</small>
+      </section>
+
+      <RatingSection />
+
+      <section className="settings-section">
         <h3>Board</h3>
-        <div className="themes" role="radiogroup" aria-label="Theme">
+        <div className="themes" role="radiogroup" aria-label="Theme" onKeyDown={rovingKeyDown}>
           {THEME_CHOICES.map((id) => {
             // Auto previews its light and dark boards side by side.
             const [a, b] = id === "auto" ? [THEMES.porcelain, THEMES.midnight] : [THEMES[id], THEMES[id]];
@@ -120,6 +187,7 @@ export function SettingsSheet({ settings, backend, onClose }: Props) {
                 key={id}
                 role="radio"
                 aria-checked={s.theme === id}
+                tabIndex={s.theme === id ? 0 : -1}
                 className={`theme-swatch${s.theme === id ? " is-active" : ""}`}
                 onClick={() => updateSettings({ theme: id })}
               >

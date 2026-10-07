@@ -74,6 +74,21 @@ export const CLASS_GLYPH: Record<MoveClass, string> = {
   blunder: "??",
 };
 
+/** Who is ahead and by how much, from White's point of view, in words a newcomer can read. */
+export function describeAdvantage(score: Score | null): { side: string; value: string; sentence: string } {
+  if (!score) return { side: "Even", value: "0.0", sentence: "No evaluation yet" };
+  if ("mate" in score) {
+    if (score.mate === 0) return { side: "Mate", value: "#", sentence: "Checkmate" };
+    const side = score.mate > 0 ? "White" : "Black";
+    const n = Math.abs(score.mate);
+    return { side, value: `M${n}`, sentence: `${side} has a forced mate in ${n}` };
+  }
+  const pawns = Math.abs(score.cp) / 100;
+  if (pawns < 0.15) return { side: "Even", value: "0.0", sentence: "The position is about even" };
+  const side = score.cp > 0 ? "White" : "Black";
+  return { side, value: `+${pawns.toFixed(1)}`, sentence: `${side} is ahead by about ${pawns.toFixed(1)} pawns` };
+}
+
 export function formatScore(score: Score): string {
   if ("mate" in score) {
     if (score.mate === 0) return "#";

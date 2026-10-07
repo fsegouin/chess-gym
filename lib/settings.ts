@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { TIME_CONTROL_IDS } from "./clock";
 import { THEME_CHOICES, type ThemeChoice } from "./themes";
 
 export type GameMode = "play" | "training";
@@ -18,6 +19,8 @@ export interface Settings {
   /** Training mode: the smallest error that pauses the game for review. */
   pauseOn: PauseThreshold;
   showEvalBar: boolean;
+  /** Time control for new games, "none" or a preset id such as "5+3". */
+  timeControl: string;
 }
 
 export const ELO_MIN = 400;
@@ -54,6 +57,7 @@ export const DEFAULT_SETTINGS: Settings = {
   quality: "high",
   pauseOn: "mistake",
   showEvalBar: true,
+  timeControl: "none",
 };
 
 const STORAGE_KEY = "chess3d.settings.v1";
@@ -83,6 +87,7 @@ function sanitize(raw: unknown): Settings {
     quality: pick(r.quality, ["low", "high"], d.quality),
     pauseOn: pick(r.pauseOn, ["inaccuracy", "mistake", "blunder"], d.pauseOn),
     showEvalBar: bool(r.showEvalBar, d.showEvalBar),
+    timeControl: pick(r.timeControl, TIME_CONTROL_IDS, d.timeControl),
   };
 }
 
@@ -118,7 +123,8 @@ function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   // Keep several open tabs in sync.
   const onStorage = (e: StorageEvent) => {
-    if (e.key !== STORAGE_KEY) return;
+    // A null key means another tab cleared all storage.
+    if (e.key !== null && e.key !== STORAGE_KEY) return;
     current = read();
     listener();
   };
