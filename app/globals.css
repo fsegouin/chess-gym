@@ -446,18 +446,6 @@ h3 {
   --chip: var(--blunder);
 }
 
-.renderer-badge {
-  position: absolute;
-  top: 10px;
-  right: var(--gutter);
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--muted);
-  pointer-events: none;
-}
-
 .stage-message {
   position: absolute;
   left: 50%;
@@ -1014,6 +1002,16 @@ button.ply:hover {
   gap: 8px;
 }
 
+/* Long forms scroll inside the dialog; keep their actions in reach. */
+.dialog .dialog-actions {
+  position: sticky;
+  bottom: -20px;
+  margin-bottom: -20px;
+  padding: 12px 0 20px;
+  background: var(--bg);
+  box-shadow: 0 -1px 0 var(--border);
+}
+
 .settings-section {
   display: flex;
   flex-direction: column;
@@ -1189,10 +1187,9 @@ input[type="range"] {
   }
 }
 
+/* The board's focus indicator is the keyboard cursor square drawn in the scene. */
 .canvas-host:focus-visible {
-  outline: 3px solid var(--focus, var(--hint));
-  outline-offset: -3px;
-  border-radius: 12px;
+  outline: none;
 }
 
 .view-reset {
@@ -1611,6 +1608,61 @@ input[type="range"] {
   background: color-mix(in srgb, var(--mistake) 14%, transparent);
   color: var(--text);
   font-size: 13px;
+}
+
+/* ---- start screen ------------------------------------------------------- */
+
+.new-game-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Only the button and summary take pointer events, so the board can still be orbited. */
+.start-prompt {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 0 var(--gutter);
+  pointer-events: none;
+  animation: fade 0.25s ease;
+}
+
+.start-prompt > * {
+  pointer-events: auto;
+}
+
+.start-button {
+  min-height: 52px;
+  padding: 0 32px;
+  border-radius: 999px;
+  font-size: 17px;
+  font-weight: 600;
+  /* The light hairline keeps the dark button readable over dark pieces. */
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35), 0 14px 34px rgba(0, 0, 0, 0.22);
+}
+
+.start-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 10px;
+  max-width: min(20rem, 100%);
+  margin: 0;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  font-size: 13px;
+  text-align: center;
 }
 
 /* ---- boot --------------------------------------------------------------- */

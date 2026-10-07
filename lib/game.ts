@@ -87,6 +87,8 @@ export interface GameSnapshot {
   rated: boolean;
   /** The rating change this game produced, once it has ended. */
   ratingRecord: RatingRecord | null;
+  /** False until the player starts a game; nothing runs before that. */
+  started: boolean;
 }
 
 export interface LegalTarget {
@@ -109,6 +111,7 @@ interface SavedGame {
   annotations: (Annotation | null)[];
   clock?: SavedClock;
   rated?: boolean;
+  started?: boolean;
   ratedElo?: number;
   ratingRecord?: RatingRecord | null;
   resigned?: Color | null;
@@ -215,6 +218,7 @@ export class GameController {
   /** Engine strength when the rated game started; changing it mid-game makes the game unrated. */
   private ratedElo = 0;
   private ratingRecord: RatingRecord | null = null;
+  private started = false;
   private resigned: Color | null = null;
 
   constructor() {
@@ -298,6 +302,7 @@ export class GameController {
       },
       rated: this.rated,
       ratingRecord: this.ratingRecord,
+      started: this.started,
     };
   }
 
@@ -387,7 +392,9 @@ export class GameController {
    */
   private syncClock(): void {
     const shouldRun =
-      !this.disposed && !this.hidden && !this.isOver() && !this.ui.reviewing && !this.ui.review ? this.chess.turn() : null;
+      this.started && !this.disposed && !this.hidden && !this.isOver() && !this.ui.reviewing && !this.ui.review
+        ? this.chess.turn()
+        : null;
     if (shouldRun !== this.clockRunning) {
       this.settleClock();
       this.clockRunning = shouldRun;
@@ -469,7 +476,7 @@ export class GameController {
   }
 
   private advance(): void {
-    if (this.disposed || this.isOver() || this.ui.review) return;
+    if (!this.started || this.disposed || this.isOver() || this.ui.review) return;
     if (this.chess.turn() !== this.playerColor) {
       if (!this.ui.thinking) void this.opponentMove();
     } else if (getSettings().mode === "training") {
@@ -540,6 +547,7 @@ export class GameController {
 
   canMove(): boolean {
     return (
+      this.started &&
       !this.isOver() &&
       this.chess.turn() === this.playerColor &&
       !this.ui.thinking &&
@@ -880,6 +888,7 @@ export class GameController {
     this.annotations = [];
     this.clock = newClock(timeControl);
     this.clockRunning = null;
+    this.started = true;
     this.playerColor = resolveColor(choice);
     this.ui.evaluation = null;
     this.analysisCache.clear();
@@ -920,6 +929,7 @@ export class GameController {
         values: { w: this.clockValue("w"), b: this.clockValue("b") },
       },
       rated: this.rated,
+      started: this.started,
       ratedElo: this.ratedElo,
       ratingRecord: this.ratingRecord,
       resigned: this.resigned,
@@ -943,6 +953,8 @@ export class GameController {
       if (data.playerColor !== "w" && data.playerColor !== "b") return;
       if (typeof data.pgn === "string" && data.pgn.trim()) this.chess.loadPgn(data.pgn);
       this.playerColor = data.playerColor;
+      // Saves from before the start screen existed were always games in progress.
+      this.started = data.started !== false;
       const plies = this.chess.history().length;
       const saved = Array.isArray(data.annotations) ? data.annotations : [];
       this.annotations = Array.from({ length: plies }, (_, i) => (isAnnotation(saved[i]) ? saved[i] : null));
@@ -955,6 +967,7 @@ export class GameController {
       this.chess.reset();
       this.annotations = [];
       this.clock = newClock(getSettings().timeControl);
+      this.started = false;
     }
   }
 

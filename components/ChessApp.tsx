@@ -11,11 +11,12 @@ import {
   type FocusEvent,
 } from "react";
 import type { PieceSymbol, Square } from "chess.js";
+import { getTimeControl } from "@/lib/clock";
 import { CLASS_LABEL, formatScore } from "@/lib/coach";
 import { GameController, type GameSnapshot } from "@/lib/game";
 import { PROVISIONAL_GAMES, useRating } from "@/lib/rating";
 import { BoardScene } from "@/lib/scene/BoardScene";
-import { ELO_MAX, getSettings, MODE_OPTIONS, updateSettings, useSettings, type PlayerColorChoice } from "@/lib/settings";
+import { ELO_MAX, getSettings, MODE_OPTIONS, updateSettings, useSettings } from "@/lib/settings";
 import { unlockAudio } from "@/lib/sound";
 import { pieceName, sanToSpeech, squareSpeech } from "@/lib/speech";
 import { prefersDark, resolveTheme, THEMES, usePrefersDark } from "@/lib/themes";
@@ -27,10 +28,12 @@ import { IconFlag, IconGear, IconHint, IconKeyboard, IconPlus, IconResetView, Ic
 import { MoveInput } from "./MoveInput";
 import { MoveList } from "./MoveList";
 import { NewGameDialog } from "./NewGameDialog";
+import type { GameOptions } from "./NewGameForm";
 import { PromotionPicker } from "./PromotionPicker";
 import { ReplayBanner } from "./ReplayBanner";
 import { SettingsSheet } from "./SettingsSheet";
 import { ShortcutsDialog } from "./ShortcutsDialog";
+import { StartScreen } from "./StartScreen";
 import { Segmented } from "./ui";
 
 type SceneState = { status: "loading" } | { status: "ready"; backend: string } | { status: "error"; message: string };
@@ -44,6 +47,7 @@ const TILT_STEP = 0.08;
 
 function statusText(game: GameSnapshot): string {
   if (game.engineError) return "Engine unavailable";
+  if (!game.started) return "Choose your game";
   const s = game.status;
   const you = (winner: string) => winner === game.playerColor;
   if (s.kind === "checkmate") return you(s.winner) ? "Checkmate. You win" : "Checkmate. You lose";
@@ -60,6 +64,13 @@ function statusText(game: GameSnapshot): string {
   if (game.hintPending) return "Looking for a hint";
   if (game.turn !== game.playerColor) return "Opponent to move";
   return game.checkSquare ? "Check. Your move" : "Your move";
+}
+
+/** Before the first game, show the clocks the chosen time control would start with. */
+function previewClock(controlId: string): GameSnapshot["clock"] {
+  const control = getTimeControl(controlId);
+  const start = control?.initialMs ?? 0;
+  return { controlId, limited: control !== null, values: { w: start, b: start }, running: null, since: 0 };
 }
 
 function isTypingTarget(target: EventTarget | null): boolean {
@@ -224,9 +235,12 @@ export default function ChessApp() {
     replayArrows,
   ]);
 
+  // Before Start the board and clocks follow the colour chosen in Settings (White when random).
+  const viewSide = game.started ? game.playerColor : settings.playerColor === "b" ? "b" : "w";
+
   useEffect(() => {
-    if (sceneReady) sceneRef.current?.setOrientation(game.playerColor);
-  }, [sceneReady, game.playerColor]);
+    if (sceneReady) sceneRef.current?.setOrientation(viewSide);
+  }, [sceneReady, viewSide]);
 
   useEffect(() => {
     if (sceneReady) sceneRef.current?.setTheme(theme);
@@ -340,8 +354,9 @@ export default function ChessApp() {
     controller.resign();
   };
 
-  const startGame = (color: PlayerColorChoice, timeControl: string) => {
-    updateSettings({ playerColor: color, timeControl });
+  const startGame = ({ mode, color, elo, timeControl }: GameOptions) => {
+    // Settings first: the controller reads mode and strength when the game starts.
+    updateSettings({ mode, elo, playerColor: color, timeControl });
     controller.newGame(color, timeControl);
     setSelection(null);
     setView(null);
@@ -418,6 +433,9 @@ export default function ChessApp() {
   const onKey = useEffectEvent((e: KeyboardEvent) => {
     if (e.defaultPrevented || isTypingTarget(e.target)) return;
     if (settingsOpen || newGameOpen || shortcutsOpen) return; // Dialogs own the keyboard.
+    // Before the first game only help, settings, the mode switch and the camera apply.
+    const cameraKey = (e.shiftKey && e.key.startsWith("Arrow")) || ["v", "f", "+", "=", "-", "_"].includes(e.key.toLowerCase());
+    if (!game.started && !cameraKey && !["?", "escape", "s", "m"].includes(e.key.toLowerCase())) return;
     const key = e.key;
     const lower = key.toLowerCase();
 
@@ -529,6 +547,18 @@ export default function ChessApp() {
     if (e.target === e.currentTarget && e.currentTarget.matches(":focus-visible") && !cursor) moveCursor("");
   };
 
+  const newGameDefaults: GameOptions = {
+    mode: settings.mode,
+    color: settings.playerColor,
+    elo: settings.elo,
+    timeControl: settings.timeControl,
+  };
+  const startSummary = [
+    settings.mode === "training" ? "Training" : "Rated game",
+    { w: "White", b: "Black", random: "Random colour" }[settings.playerColor],
+    `Stockfish ${settings.elo >= ELO_MAX ? "Max" : settings.elo}`,
+    settings.timeControl === "none" ? "No time limit" : settings.timeControl.replace("+", " + "),
+  ].join(" · ");
   const training = settings.mode === "training";
   const over = game.status.kind !== "playing";
   const busy = game.thinking || game.reviewing || game.hintPending;
@@ -642,6 +672,14 @@ export default function ChessApp() {
           </button>
         )}
 
+        {!game.started && sceneReady && (
+          <StartScreen
+            summary={startSummary}
+            onStart={() => startGame(newGameDefaults)}
+            onCustomize={() => setSettingsOpen(true)}
+          />
+        )}
+
         {promotion && (
           <PromotionPicker color={game.playerColor} onPick={choosePromotion} onCancel={() => setPromotion(null)} />
         )}
@@ -661,15 +699,14 @@ export default function ChessApp() {
             <span>Reload the page to try again.</span>
           </div>
         )}
-        {sceneState.status === "ready" && (
-          <span className="renderer-badge" title="Graphics backend in use">
-            {sceneState.backend}
-          </span>
-        )}
       </main>
 
       <aside className="panel">
-        <Clocks clock={game.clock} playerColor={game.playerColor} opponentStrength={opponentStrength} />
+        <Clocks
+          clock={game.started ? game.clock : previewClock(settings.timeControl)}
+          playerColor={viewSide}
+          opponentStrength={opponentStrength}
+        />
 
         <div className="panel-info">
           <span>
@@ -685,7 +722,7 @@ export default function ChessApp() {
               {game.ratingRecord.change} this game
             </span>
           ) : (
-            <span className="muted">{game.rated ? "Rated game" : "Unrated"}</span>
+            <span className="muted">{!game.started ? "Not started" : game.rated ? "Rated game" : "Unrated"}</span>
           )}
         </div>
 
@@ -770,10 +807,7 @@ export default function ChessApp() {
       )}
       {newGameOpen && (
         <NewGameDialog
-          initialColor={settings.playerColor}
-          initialTimeControl={settings.timeControl}
-          elo={settings.elo}
-          mode={settings.mode}
+          initial={newGameDefaults}
           abandonsRatedGame={controller.isRatedInProgress()}
           onCancel={() => setNewGameOpen(false)}
           onStart={startGame}
