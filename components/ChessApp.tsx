@@ -16,28 +16,33 @@ import { CLASS_LABEL, formatScore, negate } from "@/lib/coach";
 import type { Score } from "@/lib/engine";
 import { GameController, type Arrow, type GameSnapshot } from "@/lib/game";
 import { buildLesson, hasLessonData, lessonPace } from "@/lib/lesson";
+import type { MoveInput as MoveChoice } from "@/lib/moves";
+import { PuzzleBoard, SESSION_SIZE } from "@/lib/puzzle";
 import { PROVISIONAL_GAMES, useRating } from "@/lib/rating";
 import { BoardScene } from "@/lib/scene/BoardScene";
 import { ELO_MAX, getSettings, MODE_OPTIONS, updateSettings, useSettings } from "@/lib/settings";
-import { playSound, renderPlacement, setSoundMaterial, unlockAudio } from "@/lib/sound";
+import { playSound, renderPlacement, setSoundMaterial, unlockAudio, type SoundKind } from "@/lib/sound";
 import { pieceName, sanToSpeech, squareSpeech } from "@/lib/speech";
 import { prefersDark, resolveTheme, THEMES, usePrefersDark } from "@/lib/themes";
+import { duePuzzles, gradePuzzle, useTraining, type Puzzle, type PuzzleResult } from "@/lib/training";
 import { Clocks } from "./Clocks";
 import { CoachCard } from "./CoachCard";
 import { EvalBar } from "./EvalBar";
 import { FeedbackChip } from "./FeedbackChip";
 import { GameOverCard } from "./GameOverCard";
-import { IconFlag, IconGear, IconHint, IconKeyboard, IconPlus, IconResetView, IconUndo } from "./icons";
+import { IconFlag, IconGear, IconHint, IconKeyboard, IconPlus, IconResetView, IconTarget, IconUndo } from "./icons";
 import { LessonPanel } from "./LessonPanel";
 import { MoveInput } from "./MoveInput";
 import { MoveList } from "./MoveList";
 import { NewGameDialog } from "./NewGameDialog";
 import type { GameOptions } from "./NewGameForm";
 import { PromotionPicker } from "./PromotionPicker";
+import { PuzzlePanel, type PuzzlePhase } from "./PuzzlePanel";
 import { ReplayBanner } from "./ReplayBanner";
 import { SettingsSheet } from "./SettingsSheet";
 import { ShortcutsDialog } from "./ShortcutsDialog";
 import { StartScreen } from "./StartScreen";
+import { TrainingDialog } from "./TrainingDialog";
 import { Segmented } from "./ui";
 
 type SceneState = { status: "loading" } | { status: "ready"; backend: string } | { status: "error"; message: string };
@@ -48,7 +53,26 @@ type ReplayView = { ply: number; seq: number; animate: boolean };
 /** Post-game coach review: a position in the lesson's steps. `seq` re-triggers the board. */
 type LessonView = { index: number; playing: boolean; animate: boolean; seq: number };
 
-/** What the board shows instead of the live game: a replayed move or a lesson step. */
+/** A practice session: puzzles from the player's own games, solved on the board. */
+type PuzzleRun = {
+  queue: Puzzle[];
+  index: number;
+  phase: PuzzlePhase;
+  /** The latest answer in SAN, and whether a right answer differed from the coach's move. */
+  answer: string | null;
+  alternative: boolean;
+  hinted: boolean;
+  /** Any wrong try on this puzzle; it then counts as failed even once found. */
+  missed: boolean;
+  results: PuzzleResult[];
+  /** What the board shows, and the move that led there so it can be animated. */
+  fen: string;
+  prevFen: string | null;
+  move: { from: Square; to: Square } | null;
+  seq: number;
+};
+
+/** What the board shows instead of the live game: a replayed move, a lesson step or a puzzle. */
 type BoardOverride = {
   key: string;
   fen: string;
@@ -97,6 +121,24 @@ function previewClock(controlId: string): GameSnapshot["clock"] {
   return { controlId, limited: control !== null, values: { w: start, b: start }, running: null, since: 0 };
 }
 
+/** The board sound for a move written in SAN; `final` marks the move that ended the game. */
+function sanSound(san: string, final = false): { kind: SoundKind; piece: PieceSymbol } {
+  const piece = (/^[KQRBN]/.test(san) ? san[0].toLowerCase() : "p") as PieceSymbol;
+  const kind: SoundKind =
+    san.endsWith("#") || final
+      ? "end"
+      : san.includes("+")
+        ? "check"
+        : san.startsWith("O-O")
+          ? "castle"
+          : san.includes("x")
+            ? "capture"
+            : "move";
+  return { kind, piece };
+}
+
+const sideToMove = (fen: string) => (fen.split(" ")[1] === "b" ? "b" : "w");
+
 function isTypingTarget(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
@@ -127,6 +169,15 @@ export default function ChessApp() {
   const [viewAdjusted, setViewAdjusted] = useState(false);
   const [confirmResign, setConfirmResign] = useState(false);
   const [lessonView, setLessonView] = useState<LessonView | null>(null);
+  const [puzzleRun, setPuzzleRun] = useState<PuzzleRun | null>(null);
+  const [trainingOpen, setTrainingOpen] = useState(false);
+  const trainingData = useTraining();
+  // Puzzles fall due over time; a coarse clock keeps the count fresh without rendering every second.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(id);
+  }, []);
 
   // Undo can shorten the history under a replay; fall back to the live game then.
   const replay = view && view.ply < game.history.length ? view : null;
@@ -139,13 +190,25 @@ export default function ChessApp() {
   );
   const lessonStep = lesson && lessonView ? lesson.steps[Math.min(lessonView.index, lesson.steps.length - 1)] : null;
 
-  const canMove = controller.canMove() && !replay && !lessonActive;
-  const selected = selection && selection.positionId === game.positionId && canMove ? selection.square : null;
+  const puzzleActive = puzzleRun !== null;
+  const currentPuzzle = puzzleRun ? (puzzleRun.queue[puzzleRun.index] ?? null) : null;
+  const puzzleBoard = useMemo(() => (currentPuzzle ? new PuzzleBoard(currentPuzzle) : null), [currentPuzzle]);
+  // While a wrong answer is still on the board, the next try waits for it to be taken back.
+  const puzzleSolving =
+    puzzleBoard !== null && (puzzleRun?.phase === "solving" || puzzleRun?.phase === "wrong") && !puzzleRun.move;
+  const puzzleDone = puzzleRun !== null && (puzzleRun.phase === "solved" || puzzleRun.phase === "revealed" || !currentPuzzle);
+
+  // Taps, the cursor and typed moves act on the puzzle during practice, on the game otherwise.
+  const mover = puzzleBoard ?? controller;
+  const moverColor = puzzleBoard ? puzzleBoard.turn : game.playerColor;
+  const positionId = puzzleRun ? -1 - puzzleRun.seq : game.positionId;
+  const canMove = puzzleRun ? puzzleSolving : controller.canMove() && !replay && !lessonActive;
+  const selected = selection && selection.positionId === positionId && canMove ? selection.square : null;
   const targets = useMemo(
-    () => (selected ? controller.legalTargets(selected) : []),
+    () => (selected ? mover.legalTargets(selected) : []),
     // positionId changes whenever the legal moves can change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [controller, selected, game.positionId],
+    [mover, selected, positionId],
   );
 
   useEffect(() => {
@@ -197,6 +260,18 @@ export default function ChessApp() {
 
   const override = ((): BoardOverride | null => {
     const h = game.history;
+    if (puzzleRun) {
+      const revealed = puzzleRun.phase === "revealed" && currentPuzzle;
+      return {
+        key: `puzzle-${puzzleRun.seq}`,
+        fen: puzzleRun.fen,
+        prevFen: puzzleRun.prevFen,
+        move: puzzleRun.move,
+        lastMove: puzzleRun.move,
+        arrows: revealed ? [uciArrow(currentPuzzle.solution, "best")] : [],
+        speed: 1,
+      };
+    }
     if (lessonStep && lessonView) {
       const key = `lesson-${lessonView.seq}`;
       const at = (ply: number) => ({ from: h[ply].from, to: h[ply].to });
@@ -225,7 +300,8 @@ export default function ChessApp() {
             prevFen: null,
             move: null,
             lastMove: lessonStep.ply > 0 ? at(lessonStep.ply - 1) : null,
-            arrows: [uciArrow(p.playedUci, "played"), uciArrow(p.bestUci, "best")],
+            // Praise shows the move itself in green; a slip shows played (orange) against better (green).
+            arrows: p.tone === "praise" ? [uciArrow(p.playedUci, "best")] : [uciArrow(p.playedUci, "played"), uciArrow(p.bestUci, "best")],
             speed: 1,
           };
         }
@@ -293,14 +369,15 @@ export default function ChessApp() {
   }, [sceneReady, overrideKey, game.positionId, game.fen, game.animate]);
 
   useEffect(() => {
+    const lastOverride = overrideLast
+      ? { from: overrideLast.slice(0, 2) as Square, to: overrideLast.slice(2, 4) as Square }
+      : null;
     sceneRef.current?.setHighlights(
-      overrideFen
+      overrideFen && !puzzleActive
         ? {
             selected: null,
             targets: [],
-            lastMove: overrideLast
-              ? { from: overrideLast.slice(0, 2) as Square, to: overrideLast.slice(2, 4) as Square }
-              : null,
+            lastMove: lastOverride,
             check: null,
             arrows: overrideArrows,
             cursor: null,
@@ -308,14 +385,15 @@ export default function ChessApp() {
         : {
             selected,
             targets: settings.showLegalMoves ? targets : [],
-            lastMove: settings.showLastMove ? game.lastMove : null,
-            check: game.checkSquare,
-            arrows: game.arrows,
+            lastMove: puzzleActive ? lastOverride : settings.showLastMove ? game.lastMove : null,
+            check: puzzleActive ? null : game.checkSquare,
+            arrows: puzzleActive ? overrideArrows : game.arrows,
             cursor,
           },
     );
   }, [
     sceneReady,
+    puzzleActive,
     selected,
     targets,
     settings.showLegalMoves,
@@ -330,7 +408,9 @@ export default function ChessApp() {
   ]);
 
   // Before Start the board and clocks follow the colour chosen in Settings (White when random).
-  const viewSide = game.started ? game.playerColor : settings.playerColor === "b" ? "b" : "w";
+  // A puzzle is seen from the side to move; the finished session keeps the last one's view.
+  const puzzleSide = puzzleRun ? sideToMove(puzzleRun.queue[Math.min(puzzleRun.index, puzzleRun.queue.length - 1)].fen) : null;
+  const viewSide = puzzleSide ?? (game.started ? game.playerColor : settings.playerColor === "b" ? "b" : "w");
 
   useEffect(() => {
     if (sceneReady) sceneRef.current?.setOrientation(viewSide);
@@ -391,21 +471,9 @@ export default function ChessApp() {
     const step = lesson.steps[index];
     if (delta > 0 && step.kind === "move" && settings.sound) {
       const entry = game.history[step.ply];
-      const san = entry.san;
-      const piece = (/^[KQRBN]/.test(san) ? san[0].toLowerCase() : "p") as PieceSymbol;
       const finalMove = step.ply === game.history.length - 1 && game.status.kind !== "playing";
-      playSound(
-        san.endsWith("#") || finalMove
-          ? "end"
-          : san.includes("+")
-            ? "check"
-            : san.startsWith("O-O")
-              ? "castle"
-              : san.includes("x")
-                ? "capture"
-                : "move",
-        { piece, to: entry.to },
-      );
+      const { kind, piece } = sanSound(entry.san, finalMove);
+      playSound(kind, { piece, to: entry.to });
     }
   };
 
@@ -437,60 +505,209 @@ export default function ChessApp() {
     else if (next >= 0) setView((v) => ({ ply: next, seq: (v?.seq ?? 0) + 1, animate: delta > 0 }));
   };
 
-  const handleTap = useCallback(
-    (square: Square | null) => {
-      unlockAudio();
-      if (promotion || lessonActive) return;
-      if (replay) {
-        goLive();
-        return;
-      }
-      if (!square) {
-        setSelection(null);
-        controller.clearArrows();
-        return;
-      }
-      if (!controller.canMove()) return;
-      const snap = controller.getSnapshot();
-      if (selected) {
-        const target = controller.legalTargets(selected).find((t) => t.to === square);
-        if (target) {
-          if (target.promotion) {
-            setPromotion({ from: selected, to: square });
-          } else {
-            void controller.playerMove(selected, square);
-            setSelection(null);
-          }
-          return;
-        }
-      }
-      const piece = controller.pieceAt(square);
-      if (piece && piece.color === snap.playerColor && square !== selected) {
-        setSelection({ square, positionId: snap.positionId });
-      } else {
-        setSelection(null);
-      }
-    },
-    [controller, promotion, selected, replay, goLive, lessonActive],
-  );
+  // Bumped whenever the session moves on, so an answer still being checked cannot land late.
+  const answerToken = useRef(0);
 
+  const answerPuzzle = async (move: MoveChoice) => {
+    if (!puzzleRun || !puzzleBoard || !puzzleSolving) return;
+    const puzzle = puzzleBoard.puzzle;
+    const seq = puzzleRun.seq + 1;
+    const token = ++answerToken.current;
+    // Hints and earlier tries cannot change while the answer is checked, so the grade is known now.
+    const result: PuzzleResult = puzzleRun.missed || puzzleRun.hinted ? "failed" : "solved";
+    const preview = puzzleBoard.preview(move);
+    if (settings.sound) {
+      const { kind, piece } = sanSound(preview.san);
+      playSound(kind, { piece, to: move.to });
+    }
+    setPuzzleRun({
+      ...puzzleRun,
+      phase: "checking",
+      answer: preview.san,
+      fen: preview.fen,
+      prevFen: puzzleRun.fen,
+      move: { from: move.from, to: move.to },
+      seq,
+    });
+    // Without the engine only the coach's own move and checkmates can be confirmed.
+    const verdict = await puzzleBoard.judge(move, (fen) => controller.scorePosition(fen)).catch(() => null);
+    if (token !== answerToken.current) return;
+    if (!verdict?.correct) {
+      setPuzzleRun((run) => run && { ...run, phase: "wrong", missed: true });
+      return;
+    }
+    gradePuzzle(puzzle.id, result);
+    setPuzzleRun((run) => run && { ...run, phase: "solved", alternative: !verdict.exact, results: [...run.results, result] });
+  };
+
+  // A wrong answer stays on the board for a moment, then the puzzle position comes back.
+  const puzzlePhase = puzzleRun?.phase;
+  const puzzleSeq = puzzleRun?.seq;
+  useEffect(() => {
+    if (puzzlePhase !== "wrong") return;
+    const id = window.setTimeout(() => {
+      setPuzzleRun((run) =>
+        run && run.phase === "wrong" && run.move
+          ? { ...run, fen: run.queue[run.index].fen, prevFen: null, move: null, seq: run.seq + 1 }
+          : run,
+      );
+    }, 900);
+    return () => window.clearTimeout(id);
+  }, [puzzlePhase, puzzleSeq]);
+
+  const playMove = (from: Square, to: Square, promotion?: PieceSymbol) => {
+    if (puzzleActive) void answerPuzzle({ from, to, promotion });
+    else void controller.playerMove(from, to, promotion);
+  };
+
+  const handleTap = (square: Square | null) => {
+    unlockAudio();
+    if (promotion || lessonActive) return;
+    if (replay) {
+      goLive();
+      return;
+    }
+    if (!square) {
+      setSelection(null);
+      if (!puzzleActive) controller.clearArrows();
+      return;
+    }
+    if (!canMove) return;
+    if (selected) {
+      const target = mover.legalTargets(selected).find((t) => t.to === square);
+      if (target) {
+        if (target.promotion) {
+          setPromotion({ from: selected, to: square });
+        } else {
+          playMove(selected, square);
+          setSelection(null);
+        }
+        return;
+      }
+    }
+    const piece = mover.pieceAt(square);
+    if (piece && piece.color === moverColor && square !== selected) {
+      setSelection({ square, positionId });
+    } else {
+      setSelection(null);
+    }
+  };
+
+  const isInteractive = (square: Square) => {
+    if (!canMove) return false;
+    const piece = mover.pieceAt(square);
+    if (piece && piece.color === moverColor) return true;
+    return targets.some((t) => t.to === square);
+  };
+
+  // The scene keeps one pair of callbacks; they read the latest render's handlers through a ref.
+  const boardHandlers = useRef({ handleTap, isInteractive });
+  useEffect(() => {
+    boardHandlers.current = { handleTap, isInteractive };
+  });
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
-    scene.onTap = handleTap;
-    scene.isInteractive = (square) => {
-      if (!controller.canMove()) return false;
-      const piece = controller.pieceAt(square);
-      if (piece && piece.color === controller.getSnapshot().playerColor) return true;
-      return targets.some((t) => t.to === square);
-    };
-  }, [sceneReady, handleTap, controller, targets]);
+    scene.onTap = (square) => boardHandlers.current.handleTap(square);
+    scene.isInteractive = (square) => boardHandlers.current.isInteractive(square);
+  }, [sceneReady]);
 
   const choosePromotion = (piece: PieceSymbol) => {
     if (!promotion) return;
-    void controller.playerMove(promotion.from, promotion.to, piece);
+    playMove(promotion.from, promotion.to, piece);
     setPromotion(null);
     setSelection(null);
+  };
+
+  const startPractice = () => {
+    const due = duePuzzles(trainingData.puzzles, Date.now());
+    // Nothing due: practise ahead, soonest first.
+    const pool = due.length > 0 ? due : [...trainingData.puzzles].sort((a, b) => a.due - b.due);
+    const queue = pool.slice(0, SESSION_SIZE);
+    if (queue.length === 0) return;
+    answerToken.current++;
+    setTrainingOpen(false);
+    setLessonView(null);
+    setView(null);
+    setSelection(null);
+    setPromotion(null);
+    setCursor(null);
+    setPuzzleRun({
+      queue,
+      index: 0,
+      phase: "solving",
+      answer: null,
+      alternative: false,
+      hinted: false,
+      missed: false,
+      results: [],
+      fen: queue[0].fen,
+      prevFen: null,
+      move: null,
+      seq: 0,
+    });
+  };
+
+  const exitPractice = () => {
+    answerToken.current++;
+    setPuzzleRun(null);
+    setSelection(null);
+    setPromotion(null);
+    setCursor(null);
+    setNow(Date.now());
+  };
+
+  const puzzleHint = () => {
+    if (!puzzleRun || !puzzleBoard || puzzleRun.hinted) return;
+    if (puzzleRun.phase !== "solving" && puzzleRun.phase !== "wrong") return;
+    const puzzle = puzzleBoard.puzzle;
+    const from = puzzle.solution.slice(0, 2) as Square;
+    const piece = puzzleBoard.pieceAt(from);
+    // A wrong answer still on the board goes back first, so the hint shows on the puzzle position.
+    const reset = puzzleRun.move !== null;
+    const seq = reset ? puzzleRun.seq + 1 : puzzleRun.seq;
+    setPuzzleRun({ ...puzzleRun, hinted: true, ...(reset ? { fen: puzzle.fen, prevFen: null, move: null, seq } : {}) });
+    setSelection({ square: from, positionId: -1 - seq });
+    if (piece) setCursorSpeech(`Hint: move the ${pieceName(piece.type)} on ${from}.`);
+  };
+
+  const revealPuzzle = () => {
+    if (!puzzleRun || !currentPuzzle || puzzleDone) return;
+    answerToken.current++;
+    gradePuzzle(currentPuzzle.id, "failed");
+    setSelection(null);
+    setPromotion(null);
+    setPuzzleRun({
+      ...puzzleRun,
+      phase: "revealed",
+      results: [...puzzleRun.results, "failed"],
+      fen: currentPuzzle.fen,
+      prevFen: null,
+      move: null,
+      seq: puzzleRun.seq + 1,
+    });
+  };
+
+  const nextPuzzle = () => {
+    if (!puzzleRun || !currentPuzzle) return;
+    const index = puzzleRun.index + 1;
+    const next = puzzleRun.queue[index];
+    answerToken.current++;
+    setSelection(null);
+    setPromotion(null);
+    setPuzzleRun({
+      ...puzzleRun,
+      index,
+      phase: "solving",
+      answer: null,
+      alternative: false,
+      hinted: false,
+      missed: false,
+      fen: next?.fen ?? puzzleRun.fen,
+      prevFen: null,
+      move: null,
+      seq: puzzleRun.seq + 1,
+    });
   };
 
   const undo = () => {
@@ -526,7 +743,7 @@ export default function ChessApp() {
   };
 
   const describeCursor = (square: Square): string => {
-    const base = squareSpeech(square, controller.pieceAt(square));
+    const base = squareSpeech(square, mover.pieceAt(square));
     if (square === selected) return `${base}, selected`;
     const target = targets.find((t) => t.to === square);
     if (target) return `${base}, ${target.capture ? "capture" : "legal move"}`;
@@ -538,12 +755,12 @@ export default function ChessApp() {
       setCursorSpeech("Replaying an earlier move. Press End to return to the game.");
       return;
     }
-    const start = cursor ?? selected ?? game.lastMove?.to ?? (game.playerColor === "w" ? "e2" : "e7");
+    const start = cursor ?? selected ?? (puzzleActive ? null : game.lastMove?.to) ?? (moverColor === "w" ? "e2" : "e7");
     let file = FILES.indexOf(start[0]);
     let rank = Number(start[1]) - 1;
     if (cursor) {
       // Arrows follow the player's view: up is always towards the opponent.
-      const dir = game.playerColor === "w" ? 1 : -1;
+      const dir = viewSide === "w" ? 1 : -1;
       if (key === "ArrowUp") rank += dir;
       if (key === "ArrowDown") rank -= dir;
       if (key === "ArrowRight") file += dir;
@@ -565,14 +782,22 @@ export default function ChessApp() {
       setCursorSpeech("Replaying an earlier move. Press End to return to the game.");
       return;
     }
-    if (!controller.canMove()) {
-      setCursorSpeech(game.status.kind === "playing" ? "Wait for your turn." : "The game is over.");
+    if (!canMove) {
+      setCursorSpeech(
+        puzzleActive
+          ? puzzleDone
+            ? "This puzzle is done. Press Next to carry on."
+            : "Checking your move."
+          : game.status.kind === "playing"
+            ? "Wait for your turn."
+            : "The game is over.",
+      );
       return;
     }
-    const piece = controller.pieceAt(cursor);
+    const piece = mover.pieceAt(cursor);
     const isTarget = selected && targets.some((t) => t.to === cursor);
-    if (!isTarget && piece && piece.color === game.playerColor && cursor !== selected) {
-      const count = controller.legalTargets(cursor).length;
+    if (!isTarget && piece && piece.color === moverColor && cursor !== selected) {
+      const count = mover.legalTargets(cursor).length;
       setCursorSpeech(`${pieceName(piece.type)} on ${cursor} selected, ${count} legal ${count === 1 ? "move" : "moves"}.`);
     } else if (!isTarget) {
       setCursorSpeech(selected ? "Selection cancelled." : `${describeCursor(cursor)}. Not one of your pieces.`);
@@ -582,10 +807,10 @@ export default function ChessApp() {
 
   const submitTypedMove = (text: string): string | null => {
     if (replay) return "You are replaying an earlier move. Press End to return to the game first.";
-    if (!controller.canMove()) return "Wait for your turn.";
-    const move = controller.parseMove(text);
+    if (!canMove) return puzzleActive ? "This puzzle is not waiting for a move." : "Wait for your turn.";
+    const move = mover.parseMove(text);
     if (!move) return `"${text.trim()}" is not a legal move here. Try e4, Nf3, O-O, or e2e4 (add q, r, b or n to promote).`;
-    void controller.playerMove(move.from, move.to, move.promotion);
+    playMove(move.from, move.to, move.promotion);
     setSelection(null);
     setMoveInputOpen(false);
     boardRef.current?.focus();
@@ -594,14 +819,14 @@ export default function ChessApp() {
 
   const onKey = useEffectEvent((e: KeyboardEvent) => {
     if (e.defaultPrevented || isTypingTarget(e.target)) return;
-    if (settingsOpen || newGameOpen || shortcutsOpen) return; // Dialogs own the keyboard.
+    if (settingsOpen || newGameOpen || shortcutsOpen || trainingOpen) return; // Dialogs own the keyboard.
     // Before the first game only help, settings, the mode switch and the camera apply.
     const cameraKey = (e.shiftKey && e.key.startsWith("Arrow")) || ["v", "f", "+", "=", "-", "_"].includes(e.key.toLowerCase());
-    if (!game.started && !cameraKey && !["?", "escape", "s", "m"].includes(e.key.toLowerCase())) return;
+    if (!game.started && !puzzleActive && !cameraKey && !["?", "escape", "s", "m", "p"].includes(e.key.toLowerCase())) return;
     const key = e.key;
     const lower = key.toLowerCase();
 
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && lower === "z") {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && lower === "z" && !puzzleActive) {
       e.preventDefault();
       undo();
       return;
@@ -639,6 +864,31 @@ export default function ChessApp() {
         setPromotion(null);
       }
       return;
+    }
+
+    if (puzzleActive) {
+      const onPageOrBoard = !e.target || e.target === document.body || boardRef.current?.contains(e.target as Node);
+      if (key === "Escape") {
+        e.preventDefault();
+        if (selected) {
+          setSelection(null);
+          setCursorSpeech("Selection cancelled.");
+        } else exitPractice();
+        return;
+      }
+      if (lower === "h" && !e.shiftKey) {
+        e.preventDefault();
+        puzzleHint();
+        return;
+      }
+      if ((key === "Enter" || key === " ") && puzzleDone && onPageOrBoard) {
+        e.preventDefault();
+        if (currentPuzzle) nextPuzzle();
+        else exitPractice();
+        return;
+      }
+      // Only the board, typing a move, help and the camera work during practice.
+      if (!(key.startsWith("Arrow") || key === "Enter" || key === " " || key === "?" || key === "/" || cameraKey)) return;
     }
 
     if (key === "Escape") {
@@ -698,6 +948,7 @@ export default function ChessApp() {
         if (settings.mode === "training") void controller.hint();
       },
       m: () => updateSettings({ mode: settings.mode === "play" ? "training" : "play" }),
+      p: () => setTrainingOpen(true),
       s: () => setSettingsOpen(true),
       r: retry,
       t: () => controller.toggleThreat(),
@@ -746,6 +997,11 @@ export default function ChessApp() {
   const over = game.status.kind !== "playing";
   const busy = game.thinking || game.reviewing || game.hintPending;
   const status = statusText(game);
+  const duePuzzleCount = useMemo(() => duePuzzles(trainingData.puzzles, now).length, [trainingData.puzzles, now]);
+  const gamePuzzleCount = trainingData.puzzles.filter((p) => p.id.startsWith(`${game.gameId}-`)).length;
+  // Practice pauses nothing, so a running clock would keep ticking; untimed or finished games are fine.
+  const practiceBlocked = game.started && !over && game.clock.limited ? "Finish your timed game first." : null;
+  const puzzleStatus = puzzleRun ? (currentPuzzle ? `${puzzleSide === "b" ? "Black" : "White"} to play` : "Practice complete") : null;
   const lastPly = game.history.length - 1;
   const opponentStrength = settings.elo >= ELO_MAX ? "Max" : String(settings.elo);
 
@@ -824,6 +1080,21 @@ export default function ChessApp() {
         <div className="topbar-actions">
           <button
             type="button"
+            className="icon-btn training-btn"
+            aria-label={duePuzzleCount > 0 ? `Your training, ${duePuzzleCount} ${duePuzzleCount === 1 ? "puzzle" : "puzzles"} due` : "Your training"}
+            aria-keyshortcuts="P"
+            title="Your training (P)"
+            onClick={() => setTrainingOpen(true)}
+          >
+            <IconTarget />
+            {duePuzzleCount > 0 && (
+              <span className="icon-badge" aria-hidden>
+                {duePuzzleCount > 9 ? "9+" : duePuzzleCount}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
             className="icon-btn kbd-btn"
             aria-label="Keyboard shortcuts"
             aria-keyshortcuts="?"
@@ -861,7 +1132,7 @@ export default function ChessApp() {
           and question mark for every shortcut.
         </p>
 
-        {training && settings.showEvalBar && (
+        {training && settings.showEvalBar && !puzzleActive && (
           <EvalBar score={lessonActive ? lessonEval : game.evaluation} bottom={game.playerColor} pending={game.reviewing && !game.evaluation} />
         )}
 
@@ -869,10 +1140,10 @@ export default function ChessApp() {
           <div className={`status-pill${over ? " is-over" : ""}`}>
             {busy && <span className="spinner" aria-hidden />}
             <span>
-              {lessonActive ? "Coach review" : replay ? `Replaying move ${Math.floor(replay.ply / 2) + 1}` : status}
+              {puzzleStatus ?? (lessonActive ? "Coach review" : replay ? `Replaying move ${Math.floor(replay.ply / 2) + 1}` : status)}
             </span>
           </div>
-          {game.feedback && !replay && !lessonActive && (
+          {game.feedback && !replay && !lessonActive && !puzzleActive && (
             <FeedbackChip key={game.feedback.id} cls={game.feedback.cls} san={game.feedback.san} />
           )}
         </div>
@@ -890,7 +1161,7 @@ export default function ChessApp() {
           </button>
         )}
 
-        {!game.started && sceneReady && (
+        {!game.started && sceneReady && !puzzleActive && (
           <StartScreen
             choices={startChoices}
             onStart={() => startGame(newGameDefaults)}
@@ -899,7 +1170,7 @@ export default function ChessApp() {
         )}
 
         {promotion && (
-          <PromotionPicker color={game.playerColor} onPick={choosePromotion} onCancel={() => setPromotion(null)} />
+          <PromotionPicker color={moverColor} onPick={choosePromotion} onCancel={() => setPromotion(null)} />
         )}
 
         {moveInputOpen && <MoveInput onSubmit={submitTypedMove} onClose={() => setMoveInputOpen(false)} />}
@@ -919,119 +1190,151 @@ export default function ChessApp() {
         )}
       </main>
 
-      <aside className="panel">
-        <Clocks
-          clock={game.started ? game.clock : previewClock(settings.timeControl)}
-          playerColor={viewSide}
-          opponentStrength={opponentStrength}
-        />
-
-        <div className="panel-info">
-          <span>
-            Your rating{" "}
-            <strong>
-              {rating.rating}
-              {rating.games < PROVISIONAL_GAMES ? "?" : ""}
-            </strong>
-          </span>
-          {game.ratingRecord ? (
-            <span className={game.ratingRecord.change >= 0 ? "tone-best" : "tone-threat"}>
-              {game.ratingRecord.change >= 0 ? "+" : ""}
-              {game.ratingRecord.change} this game
-            </span>
-          ) : (
-            <span className="muted">{!game.started ? "Not started" : game.rated ? "Rated game" : "Unrated"}</span>
-          )}
-        </div>
-
-        {lesson && lessonView && lessonStep ? (
-          <LessonPanel
-            lesson={lesson}
-            step={lessonStep}
-            index={lessonView.index}
-            history={game.history}
-            playing={lessonView.playing}
-            onPrev={() => lessonGo(-1)}
-            onNext={() => lessonGo(1)}
-            onTogglePlay={toggleLessonPlay}
-            onRestart={startLesson}
-            onExit={() => setLessonView(null)}
-            onNewGame={() => {
-              setLessonView(null);
-              setNewGameOpen(true);
-            }}
-          />
-        ) : over && !replay && !game.review ? (
-          <GameOverCard
-            result={status}
-            ratingRecord={game.ratingRecord}
-            canReview={canReview}
-            onReview={startLesson}
-            onNewGame={() => setNewGameOpen(true)}
-          />
-        ) : replayEntry && replay ? (
-          <ReplayBanner
-            entry={replayEntry}
-            index={replay.ply}
-            total={game.history.length}
-            onPrev={() => stepReplay(-1)}
-            onNext={() => stepReplay(1)}
-            onLive={goLive}
-          />
-        ) : (
-          game.review && (
-            <CoachCard
-              review={game.review}
-              moveNumber={Math.floor(lastPly / 2) + 1}
-              color={game.history[lastPly]?.color ?? game.playerColor}
-              onRetry={retry}
-              onToggleBest={() => controller.toggleBest()}
-              onToggleThreat={() => controller.toggleThreat()}
-              onKeep={() => controller.keepMove()}
+      <aside className={`panel${puzzleActive ? " is-practice" : ""}`}>
+        {puzzleRun ? (
+          <>
+            <PuzzlePanel
+              puzzle={currentPuzzle}
+              index={puzzleRun.index}
+              total={puzzleRun.queue.length}
+              phase={puzzleRun.phase}
+              answer={puzzleRun.answer}
+              alternative={puzzleRun.alternative}
+              hinted={puzzleRun.hinted}
+              missed={puzzleRun.missed}
+              results={puzzleRun.results}
+              onHint={puzzleHint}
+              onReveal={revealPuzzle}
+              onNext={nextPuzzle}
+              onExit={exitPractice}
+              onOpenTraining={() => {
+                exitPractice();
+                setTrainingOpen(true);
+              }}
             />
-          )
+            <p className="practice-note">
+              Each puzzle is a position from one of your games where the coach found a better move. Solve it first time
+              and it comes back in a day, then further apart each time. Miss it and it returns in a few minutes.
+            </p>
+          </>
+        ) : (
+          <>
+            <Clocks
+              clock={game.started ? game.clock : previewClock(settings.timeControl)}
+              playerColor={viewSide}
+              opponentStrength={opponentStrength}
+            />
+
+            <div className="panel-info">
+              <span>
+                Your rating{" "}
+                <strong>
+                  {rating.rating}
+                  {rating.games < PROVISIONAL_GAMES ? "?" : ""}
+                </strong>
+              </span>
+              {game.ratingRecord ? (
+                <span className={game.ratingRecord.change >= 0 ? "tone-best" : "tone-threat"}>
+                  {game.ratingRecord.change >= 0 ? "+" : ""}
+                  {game.ratingRecord.change} this game
+                </span>
+              ) : (
+                <span className="muted">{!game.started ? "Not started" : game.rated ? "Rated game" : "Unrated"}</span>
+              )}
+            </div>
+
+            {lesson && lessonView && lessonStep ? (
+              <LessonPanel
+                lesson={lesson}
+                step={lessonStep}
+                index={lessonView.index}
+                history={game.history}
+                playing={lessonView.playing}
+                onPrev={() => lessonGo(-1)}
+                onNext={() => lessonGo(1)}
+                onTogglePlay={toggleLessonPlay}
+                onRestart={startLesson}
+                onExit={() => setLessonView(null)}
+                onNewGame={() => {
+                  setLessonView(null);
+                  setNewGameOpen(true);
+                }}
+              />
+            ) : over && !replay && !game.review ? (
+              <GameOverCard
+                result={status}
+                ratingRecord={game.ratingRecord}
+                canReview={canReview}
+                newPuzzles={gamePuzzleCount}
+                onReview={startLesson}
+                onNewGame={() => setNewGameOpen(true)}
+                onPractise={startPractice}
+              />
+            ) : replayEntry && replay ? (
+              <ReplayBanner
+                entry={replayEntry}
+                index={replay.ply}
+                total={game.history.length}
+                onPrev={() => stepReplay(-1)}
+                onNext={() => stepReplay(1)}
+                onLive={goLive}
+              />
+            ) : (
+              game.review && (
+                <CoachCard
+                  review={game.review}
+                  moveNumber={Math.floor(lastPly / 2) + 1}
+                  color={game.history[lastPly]?.color ?? game.playerColor}
+                  onRetry={retry}
+                  onToggleBest={() => controller.toggleBest()}
+                  onToggleThreat={() => controller.toggleThreat()}
+                  onKeep={() => controller.keepMove()}
+                />
+              )
+            )}
+
+            <MoveList history={game.history} viewed={lessonPly ?? (replay ? replay.ply : null)} onSelect={selectPly} />
+
+            <nav className="actions" aria-label="Game actions">
+              <button type="button" className="action" onClick={() => setNewGameOpen(true)} aria-keyshortcuts="N">
+                <IconPlus />
+                <span>New</span>
+              </button>
+              <button
+                type="button"
+                className="action"
+                onClick={undo}
+                disabled={game.history.length === 0}
+                aria-keyshortcuts="U"
+              >
+                <IconUndo />
+                <span>Undo</span>
+              </button>
+              {training && (
+                <button
+                  type="button"
+                  className="action"
+                  onClick={() => void controller.hint()}
+                  disabled={!canMove || game.hintPending}
+                  aria-keyshortcuts="H"
+                >
+                  <IconHint />
+                  <span>Hint</span>
+                </button>
+              )}
+              <button
+                type="button"
+                className={`action${confirmResign ? " is-confirm" : ""}`}
+                onClick={resign}
+                onBlur={() => setConfirmResign(false)}
+                disabled={over || game.history.length === 0}
+              >
+                <IconFlag />
+                <span>{confirmResign ? "Confirm" : "Resign"}</span>
+              </button>
+            </nav>
+          </>
         )}
-
-        <MoveList history={game.history} viewed={lessonPly ?? (replay ? replay.ply : null)} onSelect={selectPly} />
-
-        <nav className="actions" aria-label="Game actions">
-          <button type="button" className="action" onClick={() => setNewGameOpen(true)} aria-keyshortcuts="N">
-            <IconPlus />
-            <span>New</span>
-          </button>
-          <button
-            type="button"
-            className="action"
-            onClick={undo}
-            disabled={game.history.length === 0}
-            aria-keyshortcuts="U"
-          >
-            <IconUndo />
-            <span>Undo</span>
-          </button>
-          {training && (
-            <button
-              type="button"
-              className="action"
-              onClick={() => void controller.hint()}
-              disabled={!canMove || game.hintPending}
-              aria-keyshortcuts="H"
-            >
-              <IconHint />
-              <span>Hint</span>
-            </button>
-          )}
-          <button
-            type="button"
-            className={`action${confirmResign ? " is-confirm" : ""}`}
-            onClick={resign}
-            onBlur={() => setConfirmResign(false)}
-            disabled={over || game.history.length === 0}
-          >
-            <IconFlag />
-            <span>{confirmResign ? "Confirm" : "Resign"}</span>
-          </button>
-        </nav>
       </aside>
 
       <div className="sr-only" aria-live="polite" aria-atomic="true">
@@ -1057,6 +1360,13 @@ export default function ChessApp() {
         />
       )}
       {shortcutsOpen && <ShortcutsDialog onClose={() => setShortcutsOpen(false)} />}
+      {trainingOpen && (
+        <TrainingDialog
+          blockedReason={practiceBlocked}
+          onPractise={startPractice}
+          onClose={() => setTrainingOpen(false)}
+        />
+      )}
     </div>
   );
 }

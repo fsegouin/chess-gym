@@ -46,7 +46,8 @@ export function classify(before: Score, after: Score, playedBest: boolean): Move
   const keptMate = "mate" in after && after.mate > 0;
   const loss = winningChances(toCp(before)) - winningChances(toCp(after));
   if (loss >= BLUNDER_LOSS) return "blunder";
-  if (hadMate && !keptMate) return toCp(after) > MISSED_MATE_STILL_WINNING_CP ? "mistake" : "blunder";
+  // Any remaining eval at or below this already counted as a blunder above.
+  if (hadMate && !keptMate && toCp(after) > MISSED_MATE_STILL_WINNING_CP) return "mistake";
   if (loss >= MISTAKE_LOSS) return "mistake";
   if (loss >= INACCURACY_LOSS) return "inaccuracy";
   return "good";
@@ -95,5 +96,7 @@ export function formatScore(score: Score): string {
     return `${score.mate > 0 ? "" : "-"}M${Math.abs(score.mate)}`;
   }
   const pawns = score.cp / 100;
+  // Rounds to 0.0 without a stray minus sign.
+  if (Math.abs(pawns) < 0.05) return "0.0";
   return `${pawns > 0 ? "+" : ""}${pawns.toFixed(1)}`;
 }

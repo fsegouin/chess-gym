@@ -93,8 +93,10 @@ function write(next: RatingState): void {
 /** Applies one rated game against an opponent of the given strength and returns the record. */
 export function recordResult(opponent: number, result: GameResult): RatingRecord {
   const state = getRating();
-  const change = Math.round(kFactor(state.games) * (result - expectedScore(state.rating, opponent)));
-  const rating = Math.max(100, state.rating + change);
+  const delta = Math.round(kFactor(state.games) * (result - expectedScore(state.rating, opponent)));
+  const rating = Math.max(100, state.rating + delta);
+  // At the floor the rating cannot fall further, so the history records what actually changed.
+  const change = rating - state.rating;
   const record: RatingRecord = { at: Date.now(), opponent, result, change, rating };
   write({
     rating,

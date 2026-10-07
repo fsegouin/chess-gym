@@ -14,6 +14,8 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Stockfish build copied from node_modules.
     "public/engine/**",
+    "test-results/**",
+    "playwright-report/**",
   ]),
 ]);
 

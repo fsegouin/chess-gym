@@ -82,3 +82,11 @@ export const IconClose = () => (
     <path d="M6 6l12 12M18 6 6 18" />
   </Icon>
 );
+
+export const IconTarget = () => (
+  <Icon>
+    <circle cx="12" cy="12" r="8.5" />
+    <circle cx="12" cy="12" r="4.5" />
+    <circle cx="12" cy="12" r="0.9" fill="currentColor" />
+  </Icon>
+);

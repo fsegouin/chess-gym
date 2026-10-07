@@ -591,47 +591,221 @@ h3 {
 
 /* ---- promotion ---------------------------------------------------------- */
 
+/* Same veil as the start screen: the canvas ignores backdrop-filter, so the board recedes behind
+   the page colour and only the choices take pointer events. */
 .promotion {
   position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  padding: 0 var(--gutter);
+  pointer-events: none;
+  background: color-mix(in srgb, var(--bg) 84%, transparent);
+  animation: fade 0.25s ease;
+
+  --piece-fill: #fbfaf6;
+  --piece-line: #2b2925;
+  --piece-detail: #2b2925;
+}
+
+.promotion[data-color="b"] {
+  --piece-fill: #2b2925;
+  --piece-detail: #fbfaf6;
+}
+
+:root[data-scheme="dark"] .promotion {
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
+  --piece-line: #0d0e11;
+  --piece-detail: #0d0e11;
+}
+
+/* A dark silhouette on a dark tile needs a light rim to keep its shape. */
+:root[data-scheme="dark"] .promotion[data-color="b"] {
+  --piece-fill: #0d0e11;
+  --piece-line: color-mix(in srgb, var(--text) 72%, transparent);
+  --piece-detail: var(--text);
+}
+
+.stage:has(> .promotion) .status-row {
+  z-index: 6;
+}
+
+.promotion-panel {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
-  padding: 14px 16px 12px;
-  border-radius: 18px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.18);
+  gap: 20px;
+  width: min(440px, 100%);
+  text-align: center;
+  text-shadow: 0 0 2px var(--bg), 0 0 12px var(--bg);
+  animation: rise 0.3s ease;
 }
 
 .promotion-title {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+.promotion-options {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+
+.promotion-choice {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 4px 14px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--text) 5%, var(--bg));
+  box-shadow: inset 0 0 0 1px var(--border);
+  text-shadow: none;
+  pointer-events: auto;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.promotion-choice:hover {
+  background: color-mix(in srgb, var(--text) 9%, var(--bg));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 18%, transparent);
+}
+
+/* Inset so the ring stays clear of the neighbouring tiles. */
+.promotion-choice:focus-visible {
+  outline-offset: -2px;
+}
+
+.promotion-choice:active {
+  background: color-mix(in srgb, var(--text) 12%, var(--bg));
+}
+
+.promotion-piece {
+  width: 52px;
+  height: 52px;
+  fill: var(--piece-fill);
+  stroke: var(--piece-line);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.promotion-choice:hover .promotion-piece {
+  transform: translateY(-2px);
+}
+
+.promotion-detail {
+  fill: none;
+  stroke: var(--piece-detail);
+  stroke-linecap: round;
+}
+
+.promotion-eye {
+  fill: var(--piece-detail);
+  stroke: none;
+}
+
+.promotion-name {
   font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.promotion-choice:hover .promotion-name,
+.promotion-choice:focus-visible .promotion-name {
+  color: var(--text);
+}
+
+.promotion kbd {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 5px;
+  border-bottom-width: 1px;
+  background: transparent;
+  font-size: 10.5px;
   font-weight: 600;
   color: var(--muted);
 }
 
-.promotion-options {
-  display: flex;
+.promotion-choice kbd {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+}
+
+.promotion-cancel {
+  display: inline-flex;
+  align-items: center;
   gap: 8px;
+  min-height: 36px;
+  padding: 0 10px 0 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  pointer-events: auto;
+  transition: color 0.15s ease, background-color 0.15s ease;
 }
 
-.promotion-options button {
-  width: 56px;
-  height: 56px;
-  border-radius: 12px;
-  font-size: 34px;
-  line-height: 1;
+.promotion-cancel:hover {
+  color: var(--text);
   background: var(--border);
-  transition: transform 0.12s ease;
 }
 
-.promotion-options button:hover {
-  transform: translateY(-2px);
+/* Shortcut hints mean nothing without a keyboard. */
+@media (hover: none) {
+  .promotion kbd {
+    display: none;
+  }
+
+  .promotion-cancel {
+    min-height: 44px;
+    padding: 0 16px;
+  }
+}
+
+@media (max-width: 639px) {
+  .promotion,
+  :root[data-scheme="dark"] .promotion {
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+  }
+}
+
+@media (max-width: 519px) {
+  .promotion-panel {
+    gap: 16px;
+  }
+
+  .promotion-title {
+    font-size: 21px;
+  }
+
+  .promotion-options {
+    gap: 8px;
+  }
+
+  .promotion-choice {
+    padding: 26px 2px 12px;
+  }
+
+  .promotion-choice kbd {
+    top: 5px;
+    right: 5px;
+    min-width: 16px;
+    height: 16px;
+    font-size: 10px;
+  }
+
+  .promotion-piece {
+    width: 44px;
+    height: 44px;
+  }
 }
 
 /* ---- panel -------------------------------------------------------------- */
@@ -1757,10 +1931,26 @@ input[type="range"] {
   font-variant-numeric: tabular-nums;
 }
 
+/* Moves that shaped the game: the same card in the "best move" green. */
+.lesson-card.is-praise {
+  --chip: var(--best);
+}
+
 /* Amber and orange are too light for white text; dark text keeps the badge readable. */
 .cls-inaccuracy .coach-badge,
 .cls-mistake .coach-badge {
   color: #241a0a;
+}
+
+/* The greens are too light for small white text; a deeper shade keeps the badge above 4.5:1. */
+.cls-best .coach-badge,
+.cls-good .coach-badge,
+.is-praise .coach-badge {
+  background: color-mix(in srgb, var(--chip) 78%, #000);
+}
+
+.cls-blunder .coach-badge {
+  background: color-mix(in srgb, var(--chip) 90%, #000);
 }
 
 /* Phones and tablets: a steady, compact lesson card so the board neither shrinks too far nor jumps. */
@@ -1771,6 +1961,20 @@ input[type="range"] {
 
   .lesson-legend {
     display: none;
+  }
+
+  /* The summary is the tallest card; keep it compact so the board keeps its size. */
+  .lesson-summary {
+    gap: 4px;
+    margin: 0;
+  }
+
+  .lesson-stat {
+    padding: 5px 4px;
+  }
+
+  .lesson-stat dd {
+    font-size: 18px;
   }
 
   .lesson-text {
@@ -1968,4 +2172,187 @@ input[type="range"] {
   .feedback-chip {
     animation: none;
   }
+}
+
+/* ---- training: puzzles and patterns -------------------------------------- */
+
+.training-btn {
+  position: relative;
+}
+
+.icon-badge {
+  position: absolute;
+  top: 3px;
+  right: 2px;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accentText);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 17px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 2px var(--bg);
+}
+
+/* A puzzle is a lesson card whose accent follows the answer: neutral, solved or missed. */
+.puzzle-card {
+  --chip: var(--hint);
+}
+
+.puzzle-card.is-solved,
+.puzzle-card.is-done {
+  --chip: var(--best);
+}
+
+.puzzle-card.is-missed {
+  --chip: var(--mistake);
+}
+
+.puzzle-tally {
+  margin: 0;
+}
+
+/* A link inside a sentence: the padding grows the tap target without moving the text. */
+.inline-link {
+  font-size: inherit;
+  padding: 12px 0;
+  margin: -12px 0;
+}
+
+/* Practice keeps the panel to its card; on wide screens a short note explains the schedule. */
+.practice-note {
+  display: none;
+  margin: 0;
+  padding: 0 4px;
+  font-size: 13px;
+  color: var(--muted);
+  text-wrap: pretty;
+}
+
+@media (min-width: 1024px) {
+  .practice-note {
+    display: block;
+  }
+}
+
+.training-figures {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.training-figures > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--border);
+}
+
+.training-figures strong {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.training-figures span {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.training-figures span,
+.training-figures em {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.training-figures em {
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 600;
+}
+
+@media (max-width: 380px) {
+  .training-figures > div {
+    padding: 8px 10px;
+  }
+}
+
+.training-cta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.training-trend-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.training-trend {
+  flex-shrink: 0;
+  overflow: visible;
+}
+
+.training-trend polyline {
+  fill: none;
+  stroke: var(--best);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.training-subhead {
+  margin: 4px 0 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.training-bars {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.training-bars li {
+  display: grid;
+  grid-template-columns: minmax(0, 11.5em) minmax(0, 1fr) 2.5em;
+  align-items: center;
+  gap: 10px;
+}
+
+.training-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.training-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--text);
+  opacity: 0.7;
+}
+
+.training-count {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
 }

@@ -52,5 +52,8 @@ export function clockSpeech(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000));
   const m = Math.floor(total / 60);
   const s = total % 60;
-  return m ? `${m} minute${m === 1 ? "" : "s"} ${s} second${s === 1 ? "" : "s"}` : `${s} second${s === 1 ? "" : "s"}`;
+  const minutes = `${m} minute${m === 1 ? "" : "s"}`;
+  const seconds = `${s} second${s === 1 ? "" : "s"}`;
+  if (!m) return seconds;
+  return s ? `${minutes} ${seconds}` : minutes;
 }

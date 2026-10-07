@@ -2,7 +2,9 @@ import { Chess, type Color, type Move, type PieceSymbol, type Square } from "che
 import { getTimeControl, TIME_CONTROL_IDS } from "./clock";
 import { classify, negate, shouldPause, type Annotation, type MoveClass } from "./coach";
 import { COACH_GO, COACH_OPTIONS, Engine, opponentProfile, type Analysis, type Score } from "./engine";
+import { legalTargets, moveToUci, parseMove, uciToMove, type LegalTarget, type MoveInput } from "./moves";
 import { recordResult, type GameResult, type RatingRecord } from "./rating";
+import { recordFinishedGame } from "./training";
 import { getSettings, type PlayerColorChoice } from "./settings";
 import { playSound } from "./sound";
 
@@ -89,13 +91,11 @@ export interface GameSnapshot {
   ratingRecord: RatingRecord | null;
   /** False until the player starts a game; nothing runs before that. */
   started: boolean;
+  /** Identifies the game in training records, e.g. the puzzles it produced. */
+  gameId: string;
 }
 
-export interface LegalTarget {
-  to: Square;
-  capture: boolean;
-  promotion: boolean;
-}
+export type { LegalTarget };
 
 interface SavedClock {
   controlId: string;
@@ -112,6 +112,8 @@ interface SavedGame {
   clock?: SavedClock;
   rated?: boolean;
   started?: boolean;
+  gameId?: string;
+  gameRecorded?: boolean;
   ratedElo?: number;
   ratingRecord?: RatingRecord | null;
   resigned?: Color | null;
@@ -123,17 +125,6 @@ const ANALYSIS_CACHE_SIZE = 64;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function uciToMove(uci: string): { from: Square; to: Square; promotion?: PieceSymbol } {
-  return {
-    from: uci.slice(0, 2) as Square,
-    to: uci.slice(2, 4) as Square,
-    promotion: (uci[4] as PieceSymbol | undefined) || undefined,
-  };
-}
-
-function moveToUci(move: { from: Square; to: Square; promotion?: PieceSymbol }): string {
-  return move.from + move.to + (move.promotion ?? "");
-}
 
 function uciToSan(fen: string, uci: string | null): string | null {
   if (!uci) return null;
@@ -178,6 +169,10 @@ function cannotMate(chess: Chess, color: Color): boolean {
   return pieces.length === 0 || (pieces.length === 1 && (pieces[0]!.type === "b" || pieces[0]!.type === "n"));
 }
 
+function newGameId(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function resolveColor(choice: PlayerColorChoice): Color {
   if (choice === "random") return Math.random() < 0.5 ? "w" : "b";
   return choice;
@@ -219,6 +214,9 @@ export class GameController {
   private ratedElo = 0;
   private ratingRecord: RatingRecord | null = null;
   private started = false;
+  /** Identifies the game in training records; a finished game is recorded once. */
+  private gameId = newGameId();
+  private gameRecorded = false;
   private resigned: Color | null = null;
 
   constructor() {
@@ -303,6 +301,7 @@ export class GameController {
       rated: this.rated,
       ratingRecord: this.ratingRecord,
       started: this.started,
+      gameId: this.gameId,
     };
   }
 
@@ -556,28 +555,8 @@ export class GameController {
     );
   }
 
-  /**
-   * Reads a typed move in SAN ("Nf3", "exd5", "e8=Q") or coordinates ("g1f3", "e7e8q").
-   * Returns null when it is not legal here, or when a promotion piece is missing.
-   */
-  parseMove(text: string): { from: Square; to: Square; promotion?: PieceSymbol } | null {
-    const input = text.trim();
-    if (!input) return null;
-    const coords = /^([a-h][1-8])-?([a-h][1-8])([qrbn])?$/i.exec(input);
-    const legal = this.chess.moves({ verbose: true });
-    if (coords) {
-      const [, from, to, promo] = coords;
-      const move = legal.find(
-        (m) => m.from === from.toLowerCase() && m.to === to.toLowerCase() && m.promotion === promo?.toLowerCase(),
-      );
-      return move ? { from: move.from, to: move.to, promotion: move.promotion } : null;
-    }
-    try {
-      const move = new Chess(this.chess.fen()).move(input, { strict: false });
-      return { from: move.from, to: move.to, promotion: move.promotion };
-    } catch {
-      return null;
-    }
+  parseMove(text: string): MoveInput | null {
+    return parseMove(this.chess, text);
   }
 
   pieceAt(square: Square): { type: PieceSymbol; color: Color } | null {
@@ -585,12 +564,12 @@ export class GameController {
   }
 
   legalTargets(from: Square): LegalTarget[] {
-    const seen = new Map<Square, LegalTarget>();
-    for (const m of this.chess.moves({ square: from, verbose: true })) {
-      // Promotions produce four moves to the same square; keep one target.
-      seen.set(m.to, { to: m.to, capture: Boolean(m.captured), promotion: Boolean(m.promotion) });
-    }
-    return [...seen.values()];
+    return legalTargets(this.chess, from);
+  }
+
+  /** The coach's evaluation of a position, from the side to move; shared with puzzles. */
+  scorePosition(fen: string): Promise<Score> {
+    return this.analyse(fen).then((a) => a.score);
   }
 
   async playerMove(from: Square, to: Square, promotion?: PieceSymbol): Promise<boolean> {
@@ -631,6 +610,7 @@ export class GameController {
       if (token === this.token) {
         this.fail(e as Error);
         this.advance();
+        if (this.isOver()) this.recordGame(true);
       }
       return;
     }
@@ -649,14 +629,17 @@ export class GameController {
       after: afterForMover,
     };
     this.annotations[ply] = annotation;
+    const { mode, pauseOn } = getSettings();
+    // The player may have switched to Play while the coach was thinking.
+    const pause = mode === "training" && shouldPause(cls, pauseOn);
+    // A paused final move can still be retried, so the game is recorded once it is kept.
+    if (this.isOver() && !pause) this.recordGame();
     this.ui.reviewing = false;
     this.ui.evaluation = mated
       ? { mate: move.color === "w" ? 1 : -1 }
       : this.whitePov(after.score, this.chess.turn());
 
-    // The player may have switched to Play while the coach was thinking.
-    const { mode, pauseOn } = getSettings();
-    if (mode === "training" && shouldPause(cls, pauseOn)) {
+    if (pause) {
       this.ui.review = {
         san: move.san,
         annotation,
@@ -734,15 +717,44 @@ export class GameController {
     return this.rated && !this.isOver() && this.playerHasMoved();
   }
 
-  /** Records the result of a finished rated game, once. */
-  private settleRating(): void {
-    if (!this.rated || this.ratingRecord || !this.isOver()) return;
+  /** The finished game's result from the player's side. */
+  private playerResult(): GameResult {
     const s = this.status();
-    let result: GameResult = 0.5;
     if (s.kind === "checkmate" || s.kind === "timeout" || s.kind === "resigned") {
-      result = s.winner === this.playerColor ? 1 : 0;
+      return s.winner === this.playerColor ? 1 : 0;
     }
-    this.ratingRecord = recordResult(this.ratedElo, result);
+    return 0.5;
+  }
+
+  /** Records the result of a finished rated game, once, then the game's training data. */
+  private settleRating(): void {
+    if (!this.isOver()) return;
+    if (this.rated && !this.ratingRecord) this.ratingRecord = recordResult(this.ratedElo, this.playerResult());
+    this.recordGame();
+  }
+
+  /**
+   * Turns the finished game into puzzles and a game record, once per game. `force` records without
+   * waiting for the final move's grade, when that grade is not coming.
+   */
+  private recordGame(force = false): void {
+    if (this.gameRecorded || !this.started) return;
+    // In training the player's final move is still being graded; reviewMove records afterwards.
+    // Resigning cancels that grading, so a resigned game is recorded straight away.
+    const plies = this.chess.history().length;
+    const last = plies > 0 ? this.chess.history({ verbose: true })[plies - 1] : null;
+    const gradePending = last?.color === this.playerColor && !this.annotations[plies - 1] && !this.resigned;
+    if (!force && getSettings().mode === "training" && gradePending) return;
+    this.gameRecorded = true;
+    recordFinishedGame({
+      id: this.gameId,
+      history: this.build().history,
+      playerColor: this.playerColor,
+      mode: getSettings().mode,
+      elo: this.rated ? this.ratedElo : getSettings().elo,
+      result: this.playerResult(),
+      clockHistory: getTimeControl(this.clock.controlId) ? this.clock.history : null,
+    });
   }
 
   resign(): void {
@@ -824,6 +836,7 @@ export class GameController {
     this.ui.review = null;
     this.ui.arrows = [];
     this.ui.feedback = { id: ++this.feedbackId, cls: annotation.cls, san };
+    if (this.isOver()) this.recordGame();
     this.emit();
     this.advance();
   }
@@ -891,6 +904,8 @@ export class GameController {
     this.clock = newClock(timeControl);
     this.clockRunning = null;
     this.started = true;
+    this.gameId = newGameId();
+    this.gameRecorded = false;
     this.playerColor = resolveColor(choice);
     this.ui.evaluation = null;
     this.analysisCache.clear();
@@ -932,6 +947,8 @@ export class GameController {
       },
       rated: this.rated,
       started: this.started,
+      gameId: this.gameId,
+      gameRecorded: this.gameRecorded,
       ratedElo: this.ratedElo,
       ratingRecord: this.ratingRecord,
       resigned: this.resigned,
@@ -957,6 +974,8 @@ export class GameController {
       this.playerColor = data.playerColor;
       // Saves from before the start screen existed were always games in progress.
       this.started = data.started !== false;
+      if (typeof data.gameId === "string") this.gameId = data.gameId;
+      this.gameRecorded = data.gameRecorded === true;
       const plies = this.chess.history().length;
       const saved = Array.isArray(data.annotations) ? data.annotations : [];
       this.annotations = Array.from({ length: plies }, (_, i) => (isAnnotation(saved[i]) ? saved[i] : null));
@@ -965,6 +984,8 @@ export class GameController {
       this.ratedElo = typeof data.ratedElo === "number" ? data.ratedElo : 0;
       this.ratingRecord = data.ratingRecord ?? null;
       this.resigned = data.resigned === "w" || data.resigned === "b" ? data.resigned : null;
+      // A reload while the final move was being graded would otherwise leave the game unrecorded.
+      if (this.isOver()) this.recordGame(true);
     } catch {
       this.chess.reset();
       this.annotations = [];

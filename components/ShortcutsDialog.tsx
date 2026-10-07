@@ -21,7 +21,16 @@ const GROUPS: { title: string; items: { keys: string[][]; label: string }[] }[] 
       { keys: [["U"], [IS_MAC ? "⌘" : "Ctrl", "Z"]], label: "Undo" },
       { keys: [["H"]], label: "Hint (training)" },
       { keys: [["M"]], label: "Switch between Play and Training" },
+      { keys: [["P"]], label: "Your training: puzzles and patterns" },
       { keys: [["S"]], label: "Settings" },
+    ],
+  },
+  {
+    title: "Puzzles",
+    items: [
+      { keys: [["H"]], label: "Hint: which piece to move" },
+      { keys: [["Enter"]], label: "Next puzzle, once solved" },
+      { keys: [["Esc"]], label: "Leave practice" },
     ],
   },
   {

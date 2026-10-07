@@ -71,8 +71,9 @@ function bool(value: unknown, fallback: boolean): boolean {
 }
 
 /** Stored data may come from an older version or be hand-edited, so every field is checked. */
-function sanitize(raw: unknown): Settings {
-  const d = DEFAULT_SETTINGS;
+/** Invalid fields fall back to `base`: the defaults when loading, the current settings when updating. */
+function sanitize(raw: unknown, base: Settings = DEFAULT_SETTINGS): Settings {
+  const d = base;
   if (!raw || typeof raw !== "object") return d;
   const r = raw as Record<string, unknown>;
   const elo = typeof r.elo === "number" && Number.isFinite(r.elo) ? r.elo : d.elo;
@@ -110,7 +111,8 @@ export function getSettings(): Settings {
 }
 
 export function updateSettings(patch: Partial<Settings>): void {
-  current = sanitize({ ...getSettings(), ...patch });
+  const previous = getSettings();
+  current = sanitize({ ...previous, ...patch }, previous);
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
   } catch {

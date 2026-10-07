@@ -44,8 +44,9 @@ const FILES = "abcdefgh";
 const BOARD_TOP = 0.03;
 const FRAME = 9.1;
 const OVERLAY_Y = BOARD_TOP + 0.002;
+/** Deep enough to stand out on the lightest squares, the warm walnut ones included. */
 const ARROW_COLORS: Record<Arrow["kind"], string> = {
-  best: "#2f9e6b",
+  best: "#1f8a58",
   threat: "#d6453d",
   hint: "#2f7fd8",
   played: "#e0782b",
@@ -820,7 +821,7 @@ export class BoardScene {
       s.closePath();
       const geometry = new THREE.ShapeGeometry(s);
       geometry.rotateX(-Math.PI / 2);
-      const mesh = new THREE.Mesh(geometry, overlayMaterial(ARROW_COLORS[arrow.kind], 0.82));
+      const mesh = new THREE.Mesh(geometry, overlayMaterial(ARROW_COLORS[arrow.kind], 0.9));
       mesh.position.set(a.x, OVERLAY_Y + 0.006 + i * 0.002, a.z);
       mesh.rotation.y = Math.atan2(-dz, dx);
       mesh.renderOrder = 2;

@@ -4,11 +4,14 @@ interface Props {
   result: string;
   ratingRecord: RatingRecord | null;
   canReview: boolean;
+  /** Puzzles this game added to practice. */
+  newPuzzles: number;
   onReview: () => void;
   onNewGame: () => void;
+  onPractise: () => void;
 }
 
-export function GameOverCard({ result, ratingRecord, canReview, onReview, onNewGame }: Props) {
+export function GameOverCard({ result, ratingRecord, canReview, newPuzzles, onReview, onNewGame, onPractise }: Props) {
   return (
     <section className="game-over-card" aria-label="Game over">
       <h2 className="lesson-title">{result}</h2>
@@ -19,6 +22,15 @@ export function GameOverCard({ result, ratingRecord, canReview, onReview, onNewG
             ({ratingRecord.change >= 0 ? "+" : ""}
             {ratingRecord.change})
           </span>
+        </p>
+      )}
+      {newPuzzles > 0 && (
+        <p className="muted small">
+          {newPuzzles === 1 ? "One moment" : `${newPuzzles} moments`} from this game {newPuzzles === 1 ? "is" : "are"} now{" "}
+          {newPuzzles === 1 ? "a puzzle" : "puzzles"}.{" "}
+          <button type="button" className="link-btn inline-link" onClick={onPractise}>
+            Practise now
+          </button>
         </p>
       )}
       <div className="lesson-actions">

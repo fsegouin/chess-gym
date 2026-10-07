@@ -42,3 +42,8 @@ next-env.d.ts
 
 # engine binaries copied from node_modules at dev/build time
 /public/engine
+
+# test output
+/test-results
+/playwright-report
+/blob-report
