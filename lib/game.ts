@@ -42,7 +42,7 @@ export interface ClockSnapshot {
 export interface Arrow {
   from: Square;
   to: Square;
-  kind: "best" | "threat" | "hint";
+  kind: "best" | "threat" | "hint" | "played";
 }
 
 /** A paused training moment: the player's last move crossed the review threshold. */
@@ -767,10 +767,12 @@ export class GameController {
     this.clock.history.length = this.chess.history().length + 1;
     this.settleRating();
     if (getSettings().sound) {
-      if (this.isOver()) playSound("end");
-      else if (this.chess.inCheck()) playSound("check");
-      else if (move.captured) playSound("capture");
-      else playSound("move");
+      const detail = { piece: move.piece, to: move.to };
+      if (this.isOver()) playSound("end", detail);
+      else if (this.chess.inCheck()) playSound("check", detail);
+      else if (move.isKingsideCastle() || move.isQueensideCastle()) playSound("castle", detail);
+      else if (move.captured) playSound("capture", detail);
+      else playSound("move", detail);
     }
     this.save();
     this.emit(true);

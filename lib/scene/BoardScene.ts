@@ -48,6 +48,7 @@ const ARROW_COLORS: Record<Arrow["kind"], string> = {
   best: "#2f9e6b",
   threat: "#d6453d",
   hint: "#2f7fd8",
+  played: "#e0782b",
 };
 
 function squareToXZ(square: Square): { x: number; z: number } {
@@ -552,7 +553,8 @@ export class BoardScene {
    * Brings the pieces to the given position. Pieces that moved slide to their new square,
    * captured ones shrink away and new ones (undo, promotion) grow in place.
    */
-  setPosition(fen: string, hint: { from: Square; to: Square } | null = null): void {
+  /** `speed` above 1 shortens the animations, e.g. when a review plays moves back quickly. */
+  setPosition(fen: string, hint: { from: Square; to: Square } | null = null, speed = 1): void {
     this.flushTweens();
     this.setSelectedLift(null);
     const target = parsePlacement(fen);
@@ -581,7 +583,7 @@ export class BoardScene {
       const a = squareToXZ(from);
       const b = squareToXZ(to);
       const dist = Math.hypot(b.x - a.x, b.z - a.z);
-      const duration = Math.min(520, 240 + dist * 45);
+      const duration = Math.min(520, 240 + dist * 45) / speed;
       const lift = obj.type === "n" ? 0.55 : 0.08 + Math.min(dist, 4) * 0.03;
       moveDuration = Math.max(moveDuration, duration);
       this.tweens.push({
@@ -644,7 +646,7 @@ export class BoardScene {
       const startY = obj.holder.position.y;
       this.tweens.push({
         start: now + captureDelay,
-        duration: 220,
+        duration: 220 / speed,
         step: (t) => {
           const s = 1 - easeOut(t);
           obj.holder.scale.setScalar(Math.max(0.001, s));
@@ -823,6 +825,16 @@ export class BoardScene {
       mesh.rotation.y = Math.atan2(-dz, dx);
       mesh.renderOrder = 2;
       group.add(mesh);
+      // A one-square arrow hides under the piece; tint both squares so the move still reads.
+      if (len < 1.6) {
+        for (const at of [a, b]) {
+          const tint = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), overlayMaterial(ARROW_COLORS[arrow.kind], 0.38));
+          tint.rotation.x = -Math.PI / 2;
+          tint.position.set(at.x, OVERLAY_Y + 0.004 + i * 0.002, at.z);
+          tint.renderOrder = 1;
+          group.add(tint);
+        }
+      }
     });
   }
 

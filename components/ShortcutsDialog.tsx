@@ -34,6 +34,16 @@ const GROUPS: { title: string; items: { keys: string[][]; label: string }[] }[] 
     ],
   },
   {
+    title: "Coach review (after a game)",
+    items: [
+      { keys: [["→"], ["Enter"], ["Space"]], label: "Next step" },
+      { keys: [["←"]], label: "Previous step" },
+      { keys: [["P"]], label: "Play or pause" },
+      { keys: [["Home"]], label: "Restart the review" },
+      { keys: [["Esc"]], label: "Leave the review" },
+    ],
+  },
+  {
     title: "Replay",
     items: [
       { keys: [["["]], label: "Previous move" },

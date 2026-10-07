@@ -12,19 +12,23 @@ import {
 } from "react";
 import type { PieceSymbol, Square } from "chess.js";
 import { getTimeControl } from "@/lib/clock";
-import { CLASS_LABEL, formatScore } from "@/lib/coach";
-import { GameController, type GameSnapshot } from "@/lib/game";
+import { CLASS_LABEL, formatScore, negate } from "@/lib/coach";
+import type { Score } from "@/lib/engine";
+import { GameController, type Arrow, type GameSnapshot } from "@/lib/game";
+import { buildLesson, hasLessonData, lessonPace } from "@/lib/lesson";
 import { PROVISIONAL_GAMES, useRating } from "@/lib/rating";
 import { BoardScene } from "@/lib/scene/BoardScene";
 import { ELO_MAX, getSettings, MODE_OPTIONS, updateSettings, useSettings } from "@/lib/settings";
-import { unlockAudio } from "@/lib/sound";
+import { playSound, renderPlacement, setSoundMaterial, unlockAudio } from "@/lib/sound";
 import { pieceName, sanToSpeech, squareSpeech } from "@/lib/speech";
 import { prefersDark, resolveTheme, THEMES, usePrefersDark } from "@/lib/themes";
 import { Clocks } from "./Clocks";
 import { CoachCard } from "./CoachCard";
 import { EvalBar } from "./EvalBar";
 import { FeedbackChip } from "./FeedbackChip";
+import { GameOverCard } from "./GameOverCard";
 import { IconFlag, IconGear, IconHint, IconKeyboard, IconPlus, IconResetView, IconUndo } from "./icons";
+import { LessonPanel } from "./LessonPanel";
 import { MoveInput } from "./MoveInput";
 import { MoveList } from "./MoveList";
 import { NewGameDialog } from "./NewGameDialog";
@@ -40,6 +44,26 @@ type SceneState = { status: "loading" } | { status: "ready"; backend: string } |
 
 /** A ply being replayed from the move list; `seq` re-triggers the animation on a repeat click. */
 type ReplayView = { ply: number; seq: number; animate: boolean };
+
+/** Post-game coach review: a position in the lesson's steps. `seq` re-triggers the board. */
+type LessonView = { index: number; playing: boolean; animate: boolean; seq: number };
+
+/** What the board shows instead of the live game: a replayed move or a lesson step. */
+type BoardOverride = {
+  key: string;
+  fen: string;
+  /** Shown first so the move into `fen` can be animated. */
+  prevFen: string | null;
+  move: { from: Square; to: Square } | null;
+  lastMove: { from: Square; to: Square } | null;
+  arrows: Arrow[];
+  /** Animation speed multiplier; above 1 while a review plays quiet moves quickly. */
+  speed: number;
+};
+
+function uciArrow(uci: string, kind: Arrow["kind"]): Arrow {
+  return { from: uci.slice(0, 2) as Square, to: uci.slice(2, 4) as Square, kind };
+}
 
 const FILES = "abcdefgh";
 const ORBIT_STEP = 0.2;
@@ -102,12 +126,20 @@ export default function ChessApp() {
   const [view, setView] = useState<ReplayView | null>(null);
   const [viewAdjusted, setViewAdjusted] = useState(false);
   const [confirmResign, setConfirmResign] = useState(false);
+  const [lessonView, setLessonView] = useState<LessonView | null>(null);
 
   // Undo can shorten the history under a replay; fall back to the live game then.
   const replay = view && view.ply < game.history.length ? view : null;
   const replayEntry = replay ? game.history[replay.ply] : null;
 
-  const canMove = controller.canMove() && !replay;
+  const lessonActive = lessonView !== null;
+  const lesson = useMemo(
+    () => (lessonActive ? buildLesson(game.history, game.playerColor) : null),
+    [lessonActive, game.history, game.playerColor],
+  );
+  const lessonStep = lesson && lessonView ? lesson.steps[Math.min(lessonView.index, lesson.steps.length - 1)] : null;
+
+  const canMove = controller.canMove() && !replay && !lessonActive;
   const selected = selection && selection.positionId === game.positionId && canMove ? selection.square : null;
   const targets = useMemo(
     () => (selected ? controller.legalTargets(selected) : []),
@@ -142,7 +174,7 @@ export default function ChessApp() {
           setSceneState({ status: "ready", backend: s.backend });
           if (process.env.NODE_ENV === "development") {
             // Handle for automated browser tests.
-            (window as unknown as { __chess?: unknown }).__chess = { controller, scene: s };
+            (window as unknown as { __chess?: unknown }).__chess = { controller, scene: s, renderPlacement };
           }
         })
         .catch((err: unknown) => {
@@ -163,52 +195,114 @@ export default function ChessApp() {
     };
   }, [controller]);
 
-  const replayBefore = replayEntry?.before;
-  const replayAfter = replayEntry?.after;
-  const replayFrom = replayEntry?.from;
-  const replayTo = replayEntry?.to;
-  const replaySeq = replay?.seq;
-  const replayAnimate = replay?.animate;
+  const override = ((): BoardOverride | null => {
+    const h = game.history;
+    if (lessonStep && lessonView) {
+      const key = `lesson-${lessonView.seq}`;
+      const at = (ply: number) => ({ from: h[ply].from, to: h[ply].to });
+      switch (lessonStep.kind) {
+        case "intro":
+          return { key, fen: h[0]?.before ?? game.fen, prevFen: null, move: null, lastMove: null, arrows: [], speed: 1 };
+        case "move": {
+          const e = h[lessonStep.ply];
+          const move = at(lessonStep.ply);
+          return {
+            key,
+            fen: e.after,
+            prevFen: lessonView.animate ? e.before : null,
+            move: lessonView.animate ? move : null,
+            lastMove: move,
+            arrows: [],
+            speed: lessonView.playing && lesson ? lessonPace(lesson.steps, lessonView.index).speed : 1,
+          };
+        }
+        case "teach": {
+          // Stop before the move: what was played (orange) against what was better (green).
+          const p = lessonStep.point;
+          return {
+            key,
+            fen: h[lessonStep.ply].before,
+            prevFen: null,
+            move: null,
+            lastMove: lessonStep.ply > 0 ? at(lessonStep.ply - 1) : null,
+            arrows: [uciArrow(p.playedUci, "played"), uciArrow(p.bestUci, "best")],
+            speed: 1,
+          };
+        }
+        case "summary": {
+          const last = h.length - 1;
+          return {
+            key,
+            fen: h[last]?.after ?? game.fen,
+            prevFen: null,
+            move: null,
+            lastMove: last >= 0 ? at(last) : null,
+            arrows: [],
+            speed: 1,
+          };
+        }
+      }
+    }
+    if (replay && replayEntry) {
+      const move = { from: replayEntry.from, to: replayEntry.to };
+      const a = replayEntry.annotation;
+      const showBest = a?.bestUci && a.cls !== "best" && a.cls !== "good";
+      return {
+        key: `replay-${replay.seq}`,
+        fen: replayEntry.after,
+        prevFen: replay.animate ? replayEntry.before : null,
+        move: replay.animate ? move : null,
+        lastMove: move,
+        arrows: showBest ? [uciArrow(a.bestUci!, "best")] : [],
+        speed: 1,
+      };
+    }
+    return null;
+  })();
+
+  // Primitive keys keep the board effects from re-running on unrelated game updates.
+  const overrideKey = override?.key ?? null;
+  const overrideFen = override?.fen ?? null;
+  const overridePrev = override?.prevFen ?? null;
+  const overrideMove = override?.move ? `${override.move.from}${override.move.to}` : null;
+  const overrideLast = override?.lastMove ? `${override.lastMove.from}${override.lastMove.to}` : null;
+  const overrideSpeed = override?.speed ?? 1;
+  const overrideArrowsKey = override ? JSON.stringify(override.arrows) : null;
+  const overrideArrows = useMemo(
+    () => (overrideArrowsKey ? (JSON.parse(overrideArrowsKey) as Arrow[]) : []),
+    [overrideArrowsKey],
+  );
+
+  // An override is shown once per key: a speed change (play/pause) or a live update underneath
+  // must not replay its move.
+  const showOverride = useEffectEvent((scene: BoardScene) => {
+    if (!overrideFen) return;
+    if (overridePrev) scene.setPosition(overridePrev);
+    const move = overrideMove ? { from: overrideMove.slice(0, 2) as Square, to: overrideMove.slice(2, 4) as Square } : null;
+    scene.setPosition(overrideFen, move, overrideSpeed);
+  });
 
   useEffect(() => {
     const scene = sceneRef.current;
-    if (!sceneReady || !scene) return;
-    if (replayAfter && replayBefore && replayFrom && replayTo) {
-      // Replaying a move: show the position before it, then play it.
-      if (replayAnimate) scene.setPosition(replayBefore);
-      scene.setPosition(replayAfter, replayAnimate ? { from: replayFrom, to: replayTo } : null);
-      return;
-    }
-    scene.setPosition(game.fen, game.animate);
-  }, [
-    sceneReady,
-    game.positionId,
-    game.fen,
-    game.animate,
-    replayBefore,
-    replayAfter,
-    replayFrom,
-    replayTo,
-    replaySeq,
-    replayAnimate,
-  ]);
+    if (sceneReady && scene && overrideKey) showOverride(scene);
+  }, [sceneReady, overrideKey]);
 
-  const replayBest = replayEntry?.annotation;
-  const replayArrows = useMemo(() => {
-    if (!replayBest?.bestUci || replayBest.cls === "best" || replayBest.cls === "good") return [];
-    const uci = replayBest.bestUci;
-    return [{ from: uci.slice(0, 2) as Square, to: uci.slice(2, 4) as Square, kind: "best" as const }];
-  }, [replayBest]);
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (sceneReady && scene && !overrideKey) scene.setPosition(game.fen, game.animate);
+  }, [sceneReady, overrideKey, game.positionId, game.fen, game.animate]);
 
   useEffect(() => {
     sceneRef.current?.setHighlights(
-      replayFrom && replayTo
+      overrideFen
         ? {
             selected: null,
             targets: [],
-            lastMove: { from: replayFrom, to: replayTo },
+            lastMove: overrideLast
+              ? { from: overrideLast.slice(0, 2) as Square, to: overrideLast.slice(2, 4) as Square }
+              : null,
             check: null,
-            arrows: replayArrows,
+            arrows: overrideArrows,
             cursor: null,
           }
         : {
@@ -230,9 +324,9 @@ export default function ChessApp() {
     game.checkSquare,
     game.arrows,
     cursor,
-    replayFrom,
-    replayTo,
-    replayArrows,
+    overrideFen,
+    overrideLast,
+    overrideArrows,
   ]);
 
   // Before Start the board and clocks follow the colour chosen in Settings (White when random).
@@ -254,6 +348,11 @@ export default function ChessApp() {
     controller.refresh();
   }, [controller, settings.mode, settings.pauseOn, settings.elo]);
 
+  // Pieces sound like what they are made of.
+  useEffect(() => {
+    setSoundMaterial(theme.finish.pieces);
+  }, [theme]);
+
   // The page background and browser chrome follow the board theme.
   useEffect(() => {
     const root = document.documentElement;
@@ -264,9 +363,70 @@ export default function ChessApp() {
 
   const goLive = useCallback(() => setView(null), []);
 
-  const selectPly = useCallback((ply: number) => {
+  const selectPly = (ply: number) => {
+    if (lesson && lessonView) {
+      // Jump the lesson to that move, stopping at its teaching moment if it has one.
+      const index = lesson.steps.findIndex((s) => (s.kind === "teach" || s.kind === "move") && s.ply === ply);
+      if (index >= 0) setLessonView({ index, playing: false, animate: true, seq: lessonView.seq + 1 });
+      return;
+    }
     setView((v) => ({ ply, seq: (v?.seq ?? 0) + 1, animate: true }));
-  }, []);
+  };
+
+  const startLesson = () => {
+    setView(null);
+    setSelection(null);
+    setLessonView({ index: 0, playing: false, animate: false, seq: 0 });
+  };
+
+  const lessonGo = (delta: number) => {
+    if (!lesson || !lessonView) return;
+    const last = lesson.steps.length - 1;
+    const index = Math.max(0, Math.min(last, lessonView.index + delta));
+    if (index === lessonView.index) return;
+    // Leaving the intro starts the playback; reaching the end stops it.
+    // Leaving the intro starts playback; going back or reaching the end stops it.
+    const playing = lessonView.index === 0 && delta > 0 ? true : index === last || delta < 0 ? false : lessonView.playing;
+    setLessonView({ index, playing, animate: delta > 0, seq: lessonView.seq + 1 });
+    const step = lesson.steps[index];
+    if (delta > 0 && step.kind === "move" && settings.sound) {
+      const entry = game.history[step.ply];
+      const san = entry.san;
+      const piece = (/^[KQRBN]/.test(san) ? san[0].toLowerCase() : "p") as PieceSymbol;
+      const finalMove = step.ply === game.history.length - 1 && game.status.kind !== "playing";
+      playSound(
+        san.endsWith("#") || finalMove
+          ? "end"
+          : san.includes("+")
+            ? "check"
+            : san.startsWith("O-O")
+              ? "castle"
+              : san.includes("x")
+                ? "capture"
+                : "move",
+        { piece, to: entry.to },
+      );
+    }
+  };
+
+  const toggleLessonPlay = () => {
+    if (lessonView) setLessonView({ ...lessonView, playing: !lessonView.playing });
+  };
+
+  const advanceLesson = useEffectEvent(() => lessonGo(1));
+  const lessonStepKind = lessonStep?.kind;
+  const lessonPlaying = lessonView?.playing ?? false;
+  const lessonIndex = lessonView?.index;
+  // A primitive: every emit rebuilds the history and the lesson, which must not restart the timer.
+  const lessonDelay =
+    lessonStepKind === "move" && lesson && lessonView ? lessonPace(lesson.steps, lessonView.index).delayMs : 1100;
+
+  // While playing, replayed moves advance on their own; teaching moments wait for Next.
+  useEffect(() => {
+    if (!lessonPlaying || lessonStepKind !== "move") return;
+    const id = window.setTimeout(() => advanceLesson(), lessonDelay);
+    return () => window.clearTimeout(id);
+  }, [lessonPlaying, lessonStepKind, lessonIndex, lessonDelay]);
 
   const stepReplay = (delta: number) => {
     const total = game.history.length;
@@ -280,7 +440,7 @@ export default function ChessApp() {
   const handleTap = useCallback(
     (square: Square | null) => {
       unlockAudio();
-      if (promotion) return;
+      if (promotion || lessonActive) return;
       if (replay) {
         goLive();
         return;
@@ -311,7 +471,7 @@ export default function ChessApp() {
         setSelection(null);
       }
     },
-    [controller, promotion, selected, replay, goLive],
+    [controller, promotion, selected, replay, goLive, lessonActive],
   );
 
   useEffect(() => {
@@ -334,6 +494,7 @@ export default function ChessApp() {
   };
 
   const undo = () => {
+    setLessonView(null);
     controller.undo();
     setView(null);
     setSelection(null);
@@ -358,6 +519,7 @@ export default function ChessApp() {
     // Settings first: the controller reads mode and strength when the game starts.
     updateSettings({ mode, elo, playerColor: color, timeControl });
     controller.newGame(color, timeControl);
+    setLessonView(null);
     setSelection(null);
     setView(null);
     setNewGameOpen(false);
@@ -445,6 +607,27 @@ export default function ChessApp() {
       return;
     }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+    if (lessonView) {
+      const onPageOrBoard = !e.target || e.target === document.body || boardRef.current?.contains(e.target as Node);
+      const lessonKeys: Record<string, () => void> = {
+        ArrowRight: () => lessonGo(1),
+        ArrowLeft: () => lessonGo(-1),
+        p: toggleLessonPlay,
+        Escape: () => setLessonView(null),
+        Home: startLesson,
+      };
+      // Enter and Space also step forward, unless a focused button should get them.
+      if ((key === "Enter" || key === " ") && onPageOrBoard) lessonKeys[key] = () => lessonGo(1);
+      const action = e.shiftKey ? undefined : (lessonKeys[key] ?? lessonKeys[lower]);
+      if (action) {
+        e.preventDefault();
+        action();
+        return;
+      }
+      // Help and camera keys still work during the review; nothing else touches the game.
+      if (!cameraKey && key !== "?") return;
+    }
 
     if (promotion) {
       const piece = ({ q: "q", r: "r", b: "b", n: "n" } as Record<string, PieceSymbol>)[lower];
@@ -553,12 +736,12 @@ export default function ChessApp() {
     elo: settings.elo,
     timeControl: settings.timeControl,
   };
-  const startSummary = [
-    settings.mode === "training" ? "Training" : "Rated game",
-    { w: "White", b: "Black", random: "Random colour" }[settings.playerColor],
-    `Stockfish ${settings.elo >= ELO_MAX ? "Max" : settings.elo}`,
-    settings.timeControl === "none" ? "No time limit" : settings.timeControl.replace("+", " + "),
-  ].join(" · ");
+  const startChoices = [
+    { label: "Mode", value: settings.mode === "training" ? "Training" : "Rated" },
+    { label: "Colour", value: { w: "White", b: "Black", random: "Random" }[settings.playerColor] },
+    { label: "Opponent", value: `Stockfish ${settings.elo >= ELO_MAX ? "Max" : settings.elo}` },
+    { label: "Time", value: settings.timeControl === "none" ? "Unlimited" : settings.timeControl.replace("+", " + ") },
+  ];
   const training = settings.mode === "training";
   const over = game.status.kind !== "playing";
   const busy = game.thinking || game.reviewing || game.hintPending;
@@ -584,6 +767,39 @@ export default function ChessApp() {
     if (record) parts.push(`Your rating ${record.change >= 0 ? "rose" : "fell"} by ${Math.abs(record.change)} to ${record.rating}.`);
     return parts.join(" ");
   }, [game.history, game.playerColor, game.review, game.feedback, game.ratingRecord, status]);
+
+  const lessonSpeech = (() => {
+    if (!lessonStep) return null;
+    if (lessonStep.kind === "teach") {
+      const p = lessonStep.point;
+      return `${p.label}. ${p.title}. ${p.text} Press Next to continue.`;
+    }
+    if (lessonStep.kind === "move") {
+      const e = game.history[lessonStep.ply];
+      return `${e.color === game.playerColor ? "You" : "Opponent"} played ${sanToSpeech(e.san)}.`;
+    }
+    if (lessonStep.kind === "summary") return "Review complete.";
+    return "Coach review. Press Enter to start.";
+  })();
+
+  const lessonPly = lessonStep && (lessonStep.kind === "move" || lessonStep.kind === "teach") ? lessonStep.ply : null;
+
+  // During the review the bar follows the coach's grade nearest to the step, from White's side.
+  const lessonEval = ((): Score | null => {
+    if (!lessonStep || lessonStep.kind === "intro") return null;
+    const upTo = lessonStep.kind === "summary" ? game.history.length - 1 : lessonStep.ply;
+    for (let ply = upTo; ply >= 0; ply--) {
+      const entry = game.history[ply];
+      const a = entry.annotation;
+      if (!a) continue;
+      // A teaching stop shows the position before the move, so use the grade's "before".
+      const score = lessonStep.kind === "teach" && ply === lessonStep.ply ? a.before : a.after;
+      return entry.color === "w" ? score : negate(score);
+    }
+    return null;
+  })();
+  // Wait for the coach to finish grading the final move, so the lesson cannot shift mid-review.
+  const canReview = over && !game.reviewing && hasLessonData(game.history, game.playerColor);
 
   return (
     <div className="app" onPointerDown={unlockAudio}>
@@ -646,15 +862,17 @@ export default function ChessApp() {
         </p>
 
         {training && settings.showEvalBar && (
-          <EvalBar score={game.evaluation} bottom={game.playerColor} pending={game.reviewing && !game.evaluation} />
+          <EvalBar score={lessonActive ? lessonEval : game.evaluation} bottom={game.playerColor} pending={game.reviewing && !game.evaluation} />
         )}
 
         <div className="status-row">
           <div className={`status-pill${over ? " is-over" : ""}`}>
             {busy && <span className="spinner" aria-hidden />}
-            <span>{replay ? `Replaying move ${Math.floor(replay.ply / 2) + 1}` : status}</span>
+            <span>
+              {lessonActive ? "Coach review" : replay ? `Replaying move ${Math.floor(replay.ply / 2) + 1}` : status}
+            </span>
           </div>
-          {game.feedback && !replay && (
+          {game.feedback && !replay && !lessonActive && (
             <FeedbackChip key={game.feedback.id} cls={game.feedback.cls} san={game.feedback.san} />
           )}
         </div>
@@ -674,7 +892,7 @@ export default function ChessApp() {
 
         {!game.started && sceneReady && (
           <StartScreen
-            summary={startSummary}
+            choices={startChoices}
             onStart={() => startGame(newGameDefaults)}
             onCustomize={() => setSettingsOpen(true)}
           />
@@ -726,7 +944,32 @@ export default function ChessApp() {
           )}
         </div>
 
-        {replayEntry && replay ? (
+        {lesson && lessonView && lessonStep ? (
+          <LessonPanel
+            lesson={lesson}
+            step={lessonStep}
+            index={lessonView.index}
+            history={game.history}
+            playing={lessonView.playing}
+            onPrev={() => lessonGo(-1)}
+            onNext={() => lessonGo(1)}
+            onTogglePlay={toggleLessonPlay}
+            onRestart={startLesson}
+            onExit={() => setLessonView(null)}
+            onNewGame={() => {
+              setLessonView(null);
+              setNewGameOpen(true);
+            }}
+          />
+        ) : over && !replay && !game.review ? (
+          <GameOverCard
+            result={status}
+            ratingRecord={game.ratingRecord}
+            canReview={canReview}
+            onReview={startLesson}
+            onNewGame={() => setNewGameOpen(true)}
+          />
+        ) : replayEntry && replay ? (
           <ReplayBanner
             entry={replayEntry}
             index={replay.ply}
@@ -749,7 +992,7 @@ export default function ChessApp() {
           )
         )}
 
-        <MoveList history={game.history} viewed={replay ? replay.ply : null} onSelect={selectPly} />
+        <MoveList history={game.history} viewed={lessonPly ?? (replay ? replay.ply : null)} onSelect={selectPly} />
 
         <nav className="actions" aria-label="Game actions">
           <button type="button" className="action" onClick={() => setNewGameOpen(true)} aria-keyshortcuts="N">
@@ -792,7 +1035,7 @@ export default function ChessApp() {
       </aside>
 
       <div className="sr-only" aria-live="polite" aria-atomic="true">
-        {gameSpeech}
+        {lessonSpeech ?? gameSpeech}
       </div>
       <div className="sr-only" aria-live="assertive" aria-atomic="true">
         {cursorSpeech}
