@@ -534,7 +534,7 @@ export default function ChessApp() {
   const busy = game.thinking || game.reviewing || game.hintPending;
   const status = statusText(game);
   const lastPly = game.history.length - 1;
-  const opponentLabel = `Stockfish ${settings.elo >= ELO_MAX ? "Max" : settings.elo}`;
+  const opponentStrength = settings.elo >= ELO_MAX ? "Max" : String(settings.elo);
 
   const gameSpeech = useMemo(() => {
     const parts: string[] = [];
@@ -669,7 +669,7 @@ export default function ChessApp() {
       </main>
 
       <aside className="panel">
-        <Clocks clock={game.clock} playerColor={game.playerColor} opponentLabel={opponentLabel} />
+        <Clocks clock={game.clock} playerColor={game.playerColor} opponentStrength={opponentStrength} />
 
         <div className="panel-info">
           <span>

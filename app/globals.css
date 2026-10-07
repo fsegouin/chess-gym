@@ -1282,7 +1282,7 @@ input[type="range"] {
 
 .clocks {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -1290,6 +1290,7 @@ input[type="range"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  min-width: 0;
   gap: 8px;
   padding: 8px 12px;
   border-radius: 12px;
@@ -1331,6 +1332,30 @@ input[type="range"] {
   opacity: 0.85;
 }
 
+.clock-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 1023px) {
+  .clock-prefix,
+  .clock-increment {
+    display: none;
+  }
+}
+
+.clock-increment {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
 .clock-swatch {
   flex-shrink: 0;
   width: 10px;
@@ -1349,6 +1374,7 @@ input[type="range"] {
 }
 
 .clock-time {
+  flex-shrink: 0;
   font-size: 18px;
   font-weight: 600;
   letter-spacing: -0.01em;

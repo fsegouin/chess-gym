@@ -84,6 +84,13 @@ function parsePlacement(fen: string): Map<Square, { type: PieceSymbol; color: Co
   return out;
 }
 
+/** Seconds for the keyboard camera to cover about two thirds of the way to its goal. */
+const CAMERA_EASE_SECONDS = 0.11;
+/** How far the keyboard goal may run ahead of the camera while a key is held. */
+const MAX_GOAL_LEAD = 1.2;
+
+const prefersReducedMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
 const easeInOut = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
 const easeOut = (t: number) => 1 - Math.pow(1 - t, 3);
 
@@ -141,6 +148,9 @@ export class BoardScene {
   private pieces = new Map<Square, PieceObj>();
   private tweens: Tween[] = [];
   private cameraTween = false;
+  /** Where keyboard orbit and zoom are heading; the camera eases towards it each frame. */
+  private cameraGoal: THREE.Spherical | null = null;
+  private lastFrame = 0;
   /** Shift of the projection, in NDC, that centres the board in the free part of the stage. */
   private viewShift = { x: 0, y: 0 };
   /** Set once the user orbits or zooms, so resizes stop resetting their view. */
@@ -357,6 +367,8 @@ export class BoardScene {
     c.maxDistance = 40;
     c.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_ROTATE };
     c.addEventListener("change", () => (this.dirty = true));
+    // Grabbing the board with the pointer takes over from any keyboard glide.
+    c.addEventListener("start", () => (this.cameraGoal = null));
     this.controls = c;
   }
 
@@ -480,24 +492,60 @@ export class BoardScene {
 
   orbitBy(azimuth: number, polar: number): void {
     if (!this.renderer || this.cameraTween) return;
-    const s = new THREE.Spherical().setFromVector3(this.camera.position);
-    s.theta += azimuth;
-    s.phi = THREE.MathUtils.clamp(s.phi + polar, this.controls.minPolarAngle, this.controls.maxPolarAngle);
-    this.camera.position.setFromSpherical(s);
-    this.camera.lookAt(0, 0, 0);
-    this.controls.update();
-    this.setAdjusted(true);
-    this.dirty = true;
+    const current = new THREE.Spherical().setFromVector3(this.camera.position);
+    const goal = this.cameraGoal ?? current.clone();
+    // Holding the key keeps adding steps; cap the lead so release stops promptly.
+    // current.theta is wrapped to (-PI, PI]; wrap the lead too so crossing the seam does not jump.
+    let lead = goal.theta - current.theta;
+    while (lead > Math.PI) lead -= Math.PI * 2;
+    while (lead < -Math.PI) lead += Math.PI * 2;
+    goal.theta = current.theta + THREE.MathUtils.clamp(lead + azimuth, -MAX_GOAL_LEAD, MAX_GOAL_LEAD);
+    goal.phi = THREE.MathUtils.clamp(goal.phi + polar, this.controls.minPolarAngle, this.controls.maxPolarAngle);
+    this.moveCameraTo(goal);
   }
 
   zoomBy(factor: number): void {
     if (!this.renderer || this.cameraTween) return;
-    const s = new THREE.Spherical().setFromVector3(this.camera.position);
-    s.radius = THREE.MathUtils.clamp(s.radius * factor, this.controls.minDistance, this.controls.maxDistance);
-    this.camera.position.setFromSpherical(s);
-    this.controls.update();
+    const goal = this.cameraGoal ?? new THREE.Spherical().setFromVector3(this.camera.position);
+    goal.radius = THREE.MathUtils.clamp(goal.radius * factor, this.controls.minDistance, this.controls.maxDistance);
+    this.moveCameraTo(goal);
+  }
+
+  private moveCameraTo(goal: THREE.Spherical): void {
     this.setAdjusted(true);
     this.dirty = true;
+    if (prefersReducedMotion()) {
+      this.cameraGoal = null;
+      this.camera.position.setFromSpherical(goal);
+      this.camera.lookAt(0, 0, 0);
+      this.controls.update();
+      return;
+    }
+    this.cameraGoal = goal;
+  }
+
+  /** Eases the camera towards the keyboard goal; frame-rate independent. Returns whether it moved. */
+  private stepCameraGoal(dt: number): boolean {
+    const goal = this.cameraGoal;
+    if (!goal) return false;
+    const current = new THREE.Spherical().setFromVector3(this.camera.position);
+    let dTheta = goal.theta - current.theta;
+    while (dTheta > Math.PI) dTheta -= Math.PI * 2;
+    while (dTheta < -Math.PI) dTheta += Math.PI * 2;
+    const dPhi = goal.phi - current.phi;
+    const dRadius = goal.radius - current.radius;
+    if (Math.abs(dTheta) < 1e-4 && Math.abs(dPhi) < 1e-4 && Math.abs(dRadius) < 1e-3) {
+      this.cameraGoal = null;
+      return false;
+    }
+    const k = 1 - Math.exp(-dt / CAMERA_EASE_SECONDS);
+    current.theta += dTheta * k;
+    current.phi += dPhi * k;
+    current.radius += dRadius * k;
+    this.camera.position.setFromSpherical(current);
+    this.camera.lookAt(0, 0, 0);
+    this.controls.update();
+    return true;
   }
 
   /**
@@ -838,9 +886,13 @@ export class BoardScene {
 
   private frame = (): void => {
     const now = performance.now();
+    // Clamp dt so a stalled tab does not jump the camera when it resumes.
+    const dt = Math.min(0.1, (now - (this.lastFrame || now)) / 1000);
+    this.lastFrame = now;
     const animating = this.runTweens(now);
+    const gliding = this.cameraTween ? false : this.stepCameraGoal(dt);
     const moved = this.cameraTween ? false : this.controls.update();
-    if (animating || moved || this.dirty || this.cameraTween) {
+    if (animating || gliding || moved || this.dirty || this.cameraTween) {
       if (this.pipeline) this.pipeline.render();
       else this.renderer.render(this.scene, this.camera);
       this.dirty = false;
@@ -929,6 +981,7 @@ export class BoardScene {
   }
 
   private placeCamera(side: Color, animate: boolean): void {
+    this.cameraGoal = null;
     this.setAdjusted(false);
     const polar = this.defaultPolar();
     const azimuth = side === "w" ? 0 : Math.PI;
@@ -948,6 +1001,14 @@ export class BoardScene {
   }
 
   private animateCamera(radius: number, polar: number, azimuth: number): void {
+    this.cameraGoal = null;
+    if (prefersReducedMotion()) {
+      this.camera.position.setFromSphericalCoords(radius, polar, azimuth);
+      this.camera.lookAt(0, 0, 0);
+      this.controls.update();
+      this.dirty = true;
+      return;
+    }
     const from = new THREE.Spherical().setFromVector3(this.camera.position);
     let dTheta = azimuth - from.theta;
     // Rotate the short way round, but flip sides by turning around the board.

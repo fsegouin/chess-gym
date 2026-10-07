@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { Color } from "chess.js";
-import { clockSpeech, formatClock } from "@/lib/clock";
+import { clockSpeech, formatClock, getTimeControl } from "@/lib/clock";
 import type { ClockSnapshot } from "@/lib/game";
 
 const LOW_TIME_MS = 20_000;
@@ -20,10 +20,11 @@ function useNow(active: boolean): number {
 interface Props {
   clock: ClockSnapshot;
   playerColor: Color;
-  opponentLabel: string;
+  /** Engine rating, or "Max". */
+  opponentStrength: string;
 }
 
-export function Clocks({ clock, playerColor, opponentLabel }: Props) {
+export function Clocks({ clock, playerColor, opponentStrength }: Props) {
   const now = useNow(clock.running !== null);
   const value = (color: Color) => {
     const base = clock.values[color];
@@ -32,13 +33,14 @@ export function Clocks({ clock, playerColor, opponentLabel }: Props) {
     return clock.limited ? Math.max(0, base - elapsed) : base + elapsed;
   };
   const opponent: Color = playerColor === "w" ? "b" : "w";
-  const sides: { color: Color; label: string }[] = [
-    { color: opponent, label: opponentLabel },
+  const incrementSeconds = (getTimeControl(clock.controlId)?.incrementMs ?? 0) / 1000;
+  const sides: { color: Color; label: string; prefix?: string }[] = [
+    { color: opponent, label: opponentStrength, prefix: "Stockfish " },
     { color: playerColor, label: "You" },
   ];
   return (
     <div className="clocks" role="group" aria-label={clock.limited ? "Clocks, time left" : "Clocks, time used"}>
-      {sides.map(({ color, label }) => {
+      {sides.map(({ color, label, prefix }) => {
         const ms = value(color);
         const active = clock.running === color;
         const low = clock.limited && ms < LOW_TIME_MS;
@@ -46,11 +48,20 @@ export function Clocks({ clock, playerColor, opponentLabel }: Props) {
           <div
             key={color}
             className={`clock${active ? " is-active" : ""}${low ? " is-low" : ""}`}
-            aria-label={`${label}, ${color === "w" ? "White" : "Black"}: ${clockSpeech(ms)}${clock.limited ? " left" : " used"}`}
+            aria-label={`${prefix ?? ""}${label}, ${color === "w" ? "White" : "Black"}: ${clockSpeech(ms)}${clock.limited ? " left" : " used"}${incrementSeconds ? `, plus ${incrementSeconds} seconds after each move` : ""}`}
           >
             <span className="clock-label" aria-hidden>
               <span className={`clock-swatch is-${color}`} />
-              {label}
+              <span className="clock-name">
+                {/* Phones show only the rating so both clocks fit on one row. */}
+                {prefix && <span className="clock-prefix">{prefix}</span>}
+                {label}
+              </span>
+              {incrementSeconds > 0 && (
+                <span className="clock-increment" title={`${incrementSeconds} s added after each move`}>
+                  +{incrementSeconds}s
+                </span>
+              )}
             </span>
             <span className="clock-time" aria-hidden>
               {formatClock(ms, clock.limited)}

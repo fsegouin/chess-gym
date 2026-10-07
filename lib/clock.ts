@@ -37,14 +37,6 @@ export function getTimeControl(id: string): TimeControl | null {
   return TIME_CONTROLS.find((c) => c.id === id) ?? null;
 }
 
-export function describeTimeControl(id: string): string {
-  const c = getTimeControl(id);
-  if (!c) return "No time limit";
-  const minutes = c.initialMs / 60_000;
-  const increment = c.incrementMs / 1000;
-  return `${c.category}, ${minutes} min${increment ? ` + ${increment} s per move` : ""}`;
-}
-
 /** m:ss, h:mm:ss past an hour, and tenths of a second under ten seconds. */
 export function formatClock(ms: number, showTenths = true): string {
   const clamped = Math.max(0, ms);
