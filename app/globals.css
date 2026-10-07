@@ -1446,7 +1446,9 @@ input[type="range"] {
   grid-column: 1 / -1;
   margin: 0;
   font-size: 13px;
-  color: var(--blunder);
+  font-weight: 500;
+  /* Pulled towards the text colour: darker on light themes, lighter on dark ones, readable on both. */
+  color: color-mix(in srgb, var(--blunder) 78%, var(--text));
 }
 
 /* ---- clocks and rating -------------------------------------------------- */
@@ -2355,4 +2357,405 @@ input[type="range"] {
   text-align: right;
   font-variant-numeric: tabular-nums;
   color: var(--muted);
+}
+
+/* ---- importing a game ---------------------------------------------------- */
+
+.import-text {
+  width: 100%;
+  min-height: 140px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
+}
+
+.import-text:focus-visible {
+  outline: 2px solid var(--focus, var(--hint));
+  outline-offset: 1px;
+}
+
+/* The file input is visually replaced by its label, which stays keyboard reachable through it. */
+.import-file {
+  position: relative;
+  cursor: pointer;
+}
+
+.import-file input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.import-file:focus-within {
+  outline: 2px solid var(--focus, var(--hint));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.import-status {
+  min-height: 40px;
+}
+
+.import-summary {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+/* Always two lines, players then the game, so a long name never pushes the result out of view. */
+.import-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.import-players {
+  display: flex;
+  gap: 5px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.import-players strong,
+.import-meta,
+.import-you {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A short name keeps its first letters next to a very long one. */
+.import-players strong {
+  flex: 0 1 auto;
+  min-width: 3.5ch;
+}
+
+.clock-you {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.import-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.import-progress progress {
+  width: 100%;
+  height: 6px;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  appearance: none;
+  background: var(--border);
+  accent-color: var(--best);
+}
+
+.import-progress progress::-webkit-progress-bar {
+  background: var(--border);
+}
+
+.import-progress progress::-webkit-progress-value {
+  background: var(--best);
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+.import-progress progress::-moz-progress-bar {
+  background: var(--best);
+}
+
+/* ---- Chess TV ------------------------------------------------------------ */
+
+.tv-players {
+  margin: -4px 0 0;
+  font-size: 13px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+/* Commentary is the point of the show: never clamp it, unlike the compact lesson card on phones. */
+.tv-card .tv-text {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+
+.tv-lessons {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.tv-library {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+@media (min-width: 768px) {
+  .tv-library {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.tv-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  height: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  text-align: left;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.tv-entry:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--text) 30%, transparent);
+}
+
+.tv-entry:disabled {
+  opacity: 0.5;
+}
+
+.tv-entry-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 15px;
+}
+
+.tv-entry-players {
+  font-size: 13px;
+}
+
+.tv-entry-summary {
+  font-size: 12.5px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ---- coach's notes (written review) ------------------------------------- */
+
+.notes-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0 16px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.notes-error {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-section h3.notes-headline {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-transform: none;
+  color: var(--text);
+  text-wrap: balance;
+}
+
+.notes-points,
+.notes-focus {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.notes-points li,
+.notes-focus li {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.notes-point-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.notes-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+}
+
+/* ---- your online games --------------------------------------------------- */
+
+.online-link {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.online-input {
+  flex: 1;
+  min-width: 0;
+  height: 38px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font: 500 15px var(--font-geist-sans), system-ui, sans-serif;
+}
+
+.online-input:focus-visible {
+  outline: 2px solid var(--focus, var(--hint));
+  outline-offset: 1px;
+}
+
+.online-account strong {
+  overflow-wrap: anywhere;
+}
+
+.online-account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 12px;
+  font-size: 14px;
+}
+
+.online-account-actions {
+  display: flex;
+  gap: 14px;
+}
+
+.online-account-actions .link-btn,
+.notes-points .link-btn {
+  min-height: 32px;
+}
+
+.online-games {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.online-games li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.online-result {
+  min-width: 46px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  background: var(--border);
+}
+
+/* Mostly the text colour with a hue of the result: dark on light themes, light on dark ones. */
+.online-result.is-won {
+  background: color-mix(in srgb, var(--best) 18%, transparent);
+  color: color-mix(in srgb, var(--best) 45%, var(--text));
+}
+
+.online-result.is-lost {
+  background: color-mix(in srgb, var(--blunder) 15%, transparent);
+  color: color-mix(in srgb, var(--blunder) 50%, var(--text));
+}
+
+.online-game {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font-size: 14px;
+}
+
+.online-opponent {
+  overflow-wrap: anywhere;
+}
+
+.online-meta {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.online-review {
+  min-height: 34px;
+}
+
+.online-state {
+  min-width: 56px;
+  text-align: right;
+}
+
+/* Dialogs show their text in full; the line clamp is only for the compact lesson card. */
+.dialog .lesson-text {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+
+/* A long moment title takes its own line rather than squeezing the move label. */
+.tv-card .lesson-head {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.tv-card .lesson-move {
+  white-space: nowrap;
+}
+
+@media (max-width: 820px) {
+  /* The arrows mean something only with their legend; keep it on phones while watching. */
+  .tv-card .lesson-legend {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  /* Room for a two- or three-line summary, so the sheet does not grow as the text is read. */
+  .import-status {
+    min-height: 58px;
+  }
 }

@@ -42,6 +42,7 @@ export interface SavedGame {
   started?: boolean;
   resigned?: "w" | "b";
   annotations?: Annotation[];
+  imported?: { white: string; black: string; result: string; event: string | null; date: string | null };
 }
 
 /** Opens the app with clean storage, the given settings and optionally a saved game. */

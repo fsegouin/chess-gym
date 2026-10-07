@@ -3,12 +3,17 @@
 import { useState } from "react";
 import { SESSION_SIZE } from "@/lib/puzzle";
 import { insights, KIND_LABEL, PHASES, PUZZLE_KINDS, resetTraining, useTraining, type GamePhase } from "@/lib/training";
+import type { SyncedGame } from "@/lib/sync";
+import { OnlineGames } from "./OnlineGames";
 import { Dialog } from "./ui";
 
 interface Props {
   /** Why practice is unavailable right now, e.g. a timed game in progress; null when it can start. */
   blockedReason: string | null;
   onPractise: () => void;
+  onImport: () => void;
+  onWatch: () => void;
+  onReviewOnline: (game: SyncedGame) => void;
   onClose: () => void;
 }
 
@@ -46,7 +51,7 @@ function Bars({ rows }: { rows: { label: string; value: number }[] }) {
   );
 }
 
-export function TrainingDialog({ blockedReason, onPractise, onClose }: Props) {
+export function TrainingDialog({ blockedReason, onPractise, onImport, onWatch, onReviewOnline, onClose }: Props) {
   const state = useTraining();
   const [confirming, setConfirming] = useState(false);
   const i = insights(state);
@@ -100,6 +105,33 @@ export function TrainingDialog({ blockedReason, onPractise, onClose }: Props) {
             </div>
           </>
         )}
+      </section>
+
+      <OnlineGames onReview={onReviewOnline} />
+
+      <section className="settings-section">
+        <h3>Chess TV</h3>
+        <p className="muted small">
+          Watch famous games with commentary that explains each move and stops on the ones that decided the game.
+        </p>
+        <div>
+          <button type="button" className="btn" onClick={onWatch} aria-keyshortcuts="W">
+            Watch a classic
+          </button>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <h3>Games from elsewhere</h3>
+        <p className="muted small">
+          Paste a game from Lichess, Chess.com or over the board. The coach grades it and walks you through it, and
+          your slips join your puzzles and patterns.
+        </p>
+        <div>
+          <button type="button" className="btn" onClick={onImport} aria-keyshortcuts="I">
+            Review a game
+          </button>
+        </div>
       </section>
 
       {i.games > 0 && (

@@ -10,15 +10,18 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "broadcasts": "node --env-file-if-exists=.env.local --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/broadcasts.mts"
   },
   "dependencies": {
+    "ai": "^7.0.128",
     "chess.js": "^1.4.0",
     "next": "16.4.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "stockfish": "^19.0.0",
-    "three": "^0.186.1"
+    "three": "^0.186.1",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

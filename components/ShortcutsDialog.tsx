@@ -22,7 +22,19 @@ const GROUPS: { title: string; items: { keys: string[][]; label: string }[] }[] 
       { keys: [["H"]], label: "Hint (training)" },
       { keys: [["M"]], label: "Switch between Play and Training" },
       { keys: [["P"]], label: "Your training: puzzles and patterns" },
+      { keys: [["I"]], label: "Review a game played elsewhere (PGN)" },
+      { keys: [["W"]], label: "Chess TV: watch a classic game" },
       { keys: [["S"]], label: "Settings" },
+    ],
+  },
+  {
+    title: "Chess TV",
+    items: [
+      { keys: [["→"], ["Enter"]], label: "Next move, or carry on after a key moment" },
+      { keys: [["←"]], label: "Previous move" },
+      { keys: [["P"], ["Space"]], label: "Play or pause" },
+      { keys: [["Home"]], label: "Back to the start" },
+      { keys: [["Esc"]], label: "Stop watching" },
     ],
   },
   {

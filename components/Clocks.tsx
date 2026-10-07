@@ -22,9 +22,11 @@ interface Props {
   playerColor: Color;
   /** Engine rating, or "Max". */
   opponentStrength: string;
+  /** Names from an imported game; the boxes then name the players and show no time. */
+  players?: { you: string; opponent: string } | null;
 }
 
-export function Clocks({ clock, playerColor, opponentStrength }: Props) {
+export function Clocks({ clock, playerColor, opponentStrength, players }: Props) {
   const now = useNow(clock.running !== null);
   const value = (color: Color) => {
     const base = clock.values[color];
@@ -34,10 +36,31 @@ export function Clocks({ clock, playerColor, opponentStrength }: Props) {
   };
   const opponent: Color = playerColor === "w" ? "b" : "w";
   const incrementSeconds = (getTimeControl(clock.controlId)?.incrementMs ?? 0) / 1000;
-  const sides: { color: Color; label: string; prefix?: string }[] = [
-    { color: opponent, label: opponentStrength, prefix: "Stockfish " },
-    { color: playerColor, label: "You" },
-  ];
+  const sides: { color: Color; label: string; prefix?: string }[] = players
+    ? [
+        { color: opponent, label: players.opponent },
+        { color: playerColor, label: players.you, prefix: "you" },
+      ]
+    : [
+        { color: opponent, label: opponentStrength, prefix: "Stockfish " },
+        { color: playerColor, label: "You" },
+      ];
+  if (players) {
+    return (
+      <div className="clocks" role="group" aria-label="Players">
+        {sides.map(({ color, label, prefix }) => (
+          <div key={color} className="clock" aria-label={`${label}${prefix ? " (you)" : ""}, ${color === "w" ? "White" : "Black"}`}>
+            <span className="clock-label" aria-hidden>
+              <span className={`clock-swatch is-${color}`} />
+              <span className="clock-name">{label}</span>
+              {/* Kept outside the truncated name, so a long name never hides which side is yours. */}
+              {prefix && <span className="clock-you">you</span>}
+            </span>
+          </div>
+        ))}
+      </div>
+    );
+  }
   return (
     <div className="clocks" role="group" aria-label={clock.limited ? "Clocks, time left" : "Clocks, time used"}>
       {sides.map(({ color, label, prefix }) => {

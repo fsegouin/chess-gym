@@ -1,8 +1,10 @@
 import { Chess, type Color, type Move, type PieceSymbol, type Square } from "chess.js";
 import { getTimeControl, TIME_CONTROL_IDS } from "./clock";
-import { classify, negate, shouldPause, type Annotation, type MoveClass } from "./coach";
+import { negate, shouldPause, type Annotation, type MoveClass } from "./coach";
 import { COACH_GO, COACH_OPTIONS, Engine, opponentProfile, type Analysis, type Score } from "./engine";
 import { legalTargets, moveToUci, parseMove, uciToMove, type LegalTarget, type MoveInput } from "./moves";
+import { gradeMove, GRADING_GO, uciToSan } from "./grading";
+import { resultWinner, type GameResult as PgnResult, type ImportedGame } from "./pgn";
 import { recordResult, type GameResult, type RatingRecord } from "./rating";
 import { recordFinishedGame } from "./training";
 import { getSettings, type PlayerColorChoice } from "./settings";
@@ -27,7 +29,12 @@ export type GameStatus =
   | {
       kind: "draw";
       reason: "stalemate" | "repetition" | "insufficient material" | "fifty-move rule" | "timeout vs insufficient material";
-    };
+    }
+  /** A game brought in as PGN that did not end on the board: its recorded result stands. */
+  | { kind: "imported"; winner: Color | null; result: PgnResult };
+
+/** Who played an imported game, and how it ended. */
+export type ImportedInfo = Pick<ImportedGame, "white" | "black" | "result" | "event" | "date">;
 
 /**
  * Clock values in milliseconds: time left with a time control, time used without one.
@@ -93,6 +100,10 @@ export interface GameSnapshot {
   started: boolean;
   /** Identifies the game in training records, e.g. the puzzles it produced. */
   gameId: string;
+  /** Set for a game imported as PGN, which is only analysed, never played on. */
+  imported: ImportedInfo | null;
+  /** The coach's progress through an imported game's moves, while it grades them. */
+  importProgress: { done: number; total: number } | null;
 }
 
 export type { LegalTarget };
@@ -117,6 +128,7 @@ interface SavedGame {
   ratedElo?: number;
   ratingRecord?: RatingRecord | null;
   resigned?: Color | null;
+  imported?: ImportedInfo | null;
 }
 
 const SAVE_KEY = "chess3d.game.v1";
@@ -124,16 +136,6 @@ const MIN_REPLY_MS = 450;
 const ANALYSIS_CACHE_SIZE = 64;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-
-function uciToSan(fen: string, uci: string | null): string | null {
-  if (!uci) return null;
-  try {
-    return new Chess(fen).move(uciToMove(uci)).san;
-  } catch {
-    return null;
-  }
-}
 
 const MOVE_CLASSES: readonly MoveClass[] = ["best", "good", "inaccuracy", "mistake", "blunder"];
 
@@ -144,6 +146,12 @@ function isScore(value: unknown): value is Score {
 }
 
 /** Saved games can be stale or hand-edited; drop grades that would not render. */
+function isImportedInfo(value: unknown): value is ImportedInfo {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.white === "string" && typeof v.black === "string" && ["1-0", "0-1", "1/2-1/2", "*"].includes(v.result as string);
+}
+
 function isAnnotation(value: unknown): value is Annotation {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
@@ -202,7 +210,10 @@ export class GameController {
     arrows: [] as Arrow[],
     feedback: null as Feedback | null,
     engineError: null as string | null,
+    importProgress: null as GameSnapshot["importProgress"],
   };
+  private imported: ImportedInfo | null = null;
+  private gradingToken = -1;
   private snapshot: GameSnapshot;
   private clock: SavedClock = newClock("none");
   private clockRunning: Color | null = null;
@@ -302,6 +313,8 @@ export class GameController {
       ratingRecord: this.ratingRecord,
       started: this.started,
       gameId: this.gameId,
+      imported: this.imported,
+      importProgress: this.ui.importProgress,
     };
   }
 
@@ -318,6 +331,7 @@ export class GameController {
     if (c.isInsufficientMaterial()) return { kind: "draw", reason: "insufficient material" };
     if (c.isThreefoldRepetition()) return { kind: "draw", reason: "repetition" };
     if (c.isDrawByFiftyMoves()) return { kind: "draw", reason: "fifty-move rule" };
+    if (this.imported) return { kind: "imported", winner: resultWinner(this.imported.result), result: this.imported.result };
     return { kind: "playing" };
   }
 
@@ -331,7 +345,7 @@ export class GameController {
   }
 
   private isOver(): boolean {
-    return this.resigned !== null || this.clock.flagged !== null || this.chess.isGameOver();
+    return this.imported !== null || this.resigned !== null || this.clock.flagged !== null || this.chess.isGameOver();
   }
 
   /** Starts engines and clocks. Safe to call again after dispose (React strict mode does this). */
@@ -342,6 +356,8 @@ export class GameController {
     window.addEventListener("pagehide", this.onPageHide);
     this.emit();
     this.advance();
+    // A reload in the middle of grading an imported game carries on where it stopped.
+    if (this.imported) void this.gradeImported();
   }
 
   dispose(): void {
@@ -359,6 +375,7 @@ export class GameController {
     this.ui.thinking = false;
     this.ui.reviewing = false;
     this.ui.hintPending = false;
+    this.ui.importProgress = null;
   }
 
   /** The clock pauses while the page is hidden; this is a game against the computer. */
@@ -509,13 +526,14 @@ export class GameController {
     this.ui.thinking = false;
     this.ui.reviewing = false;
     this.ui.hintPending = false;
+    this.ui.importProgress = null;
     this.emit();
   }
 
-  private analyse(fen: string): Promise<Analysis> {
+  private analyse(fen: string, go = COACH_GO): Promise<Analysis> {
     let job = this.analysisCache.get(fen);
     if (!job) {
-      job = this.getCoach().search(fen, COACH_GO);
+      job = this.getCoach().search(fen, go);
       this.analysisCache.set(fen, job);
       job.catch(() => {
         if (this.analysisCache.get(fen) === job) this.analysisCache.delete(fen);
@@ -616,18 +634,9 @@ export class GameController {
     }
     if (token !== this.token) return;
 
-    const played = moveToUci(move);
     const mated = this.chess.isCheckmate();
-    // `after` is scored for the opponent, who is now to move.
-    const afterForMover: Score = mated ? { mate: 1 } : this.chess.isDraw() ? { cp: 0 } : negate(after.score);
-    const cls = mated ? "best" : classify(before.score, afterForMover, before.bestMove === played);
-    const annotation: Annotation = {
-      cls,
-      bestSan: uciToSan(fenBefore, before.bestMove),
-      bestUci: before.bestMove,
-      before: before.score,
-      after: afterForMover,
-    };
+    const annotation = gradeMove(move, before, after, mated, this.chess.isDraw());
+    const cls = annotation.cls;
     this.annotations[ply] = annotation;
     const { mode, pauseOn } = getSettings();
     // The player may have switched to Play while the coach was thinking.
@@ -717,10 +726,10 @@ export class GameController {
     return this.rated && !this.isOver() && this.playerHasMoved();
   }
 
-  /** The finished game's result from the player's side. */
+  /** The finished game's result from the player's side; an unfinished import counts as a draw. */
   private playerResult(): GameResult {
     const s = this.status();
-    if (s.kind === "checkmate" || s.kind === "timeout" || s.kind === "resigned") {
+    if (s.kind === "checkmate" || s.kind === "timeout" || s.kind === "resigned" || (s.kind === "imported" && s.winner)) {
       return s.winner === this.playerColor ? 1 : 0;
     }
     return 0.5;
@@ -750,8 +759,9 @@ export class GameController {
       id: this.gameId,
       history: this.build().history,
       playerColor: this.playerColor,
-      mode: getSettings().mode,
-      elo: this.rated ? this.ratedElo : getSettings().elo,
+      // An imported game is graded like a training game; its opponent's strength is unknown.
+      mode: this.imported ? "training" : getSettings().mode,
+      elo: this.imported ? 0 : this.rated ? this.ratedElo : getSettings().elo,
       result: this.playerResult(),
       clockHistory: getTimeControl(this.clock.controlId) ? this.clock.history : null,
     });
@@ -873,7 +883,7 @@ export class GameController {
 
   /** Takes back moves until it is the player's turn again, removing at least one of their moves. */
   undo(): void {
-    if (this.chess.history().length === 0) return;
+    if (this.chess.history().length === 0 || this.imported) return;
     this.settleClock();
     this.rated = false;
     this.resigned = null;
@@ -890,6 +900,73 @@ export class GameController {
     this.advance();
   }
 
+  /**
+   * Loads a game played elsewhere for the coach to grade and review. Nothing is played on: it ends
+   * where the PGN ends, with the result the PGN records.
+   */
+  importGame(game: ImportedGame, playerColor: Color, graded?: { gameId: string; annotations: (Annotation | null)[] }): void {
+    // Leaving a rated game in progress counts as a loss, as it does online.
+    if (this.isRatedInProgress()) recordResult(this.ratedElo, 0);
+    this.interrupt();
+    this.chess.loadPgn(game.pgn);
+    this.rated = false;
+    this.ratedElo = 0;
+    this.ratingRecord = null;
+    this.resigned = null;
+    // A game graded in the background arrives with its grades and is already in the training records.
+    this.annotations = this.chess.history().map((_, i) => graded?.annotations[i] ?? null);
+    this.clock = newClock("none");
+    this.clockRunning = null;
+    this.started = true;
+    this.gameId = graded?.gameId ?? newGameId();
+    this.gameRecorded = graded !== undefined;
+    this.playerColor = playerColor;
+    this.imported = { white: game.white, black: game.black, result: game.result, event: game.event, date: game.date };
+    this.ui.evaluation = null;
+    this.analysisCache.clear();
+    this.save();
+    this.emit(true);
+    void this.gradeImported();
+  }
+
+  /** Grades the player's moves in an imported game one by one, then records it for training. */
+  private async gradeImported(): Promise<void> {
+    // One grading run per token: a remount or a new game bumps the token and ends the old run.
+    if (!this.imported || this.gradingToken === this.token) return;
+    const token = this.token;
+    this.gradingToken = token;
+    const moves = this.chess.history({ verbose: true });
+    const mine = moves.map((move, ply) => ({ move, ply })).filter(({ move }) => move.color === this.playerColor);
+    const todo = mine.filter(({ ply }) => !this.annotations[ply]);
+    if (todo.length > 0) {
+      this.ui.importProgress = { done: mine.length - todo.length, total: mine.length };
+      this.ui.reviewing = true;
+      this.emit();
+      for (const { move, ply } of todo) {
+        let before: Analysis;
+        let after: Analysis;
+        try {
+          before = await this.analyse(move.before, GRADING_GO);
+          after = await this.analyse(move.after, GRADING_GO);
+        } catch (e) {
+          if (token === this.token) this.fail(e as Error);
+          return;
+        }
+        if (token !== this.token) return;
+        const position = new Chess(move.after);
+        this.annotations[ply] = gradeMove(move, before, after, position.isCheckmate(), position.isDraw());
+        this.ui.importProgress = { done: this.ui.importProgress!.done + 1, total: mine.length };
+        this.save();
+        this.emit();
+      }
+      this.ui.importProgress = null;
+      this.ui.reviewing = false;
+    }
+    this.recordGame(true);
+    this.save();
+    this.emit();
+  }
+
   newGame(choice: PlayerColorChoice, timeControl = getSettings().timeControl): void {
     // Leaving a rated game in progress counts as a loss, as it does online.
     if (this.isRatedInProgress()) recordResult(this.ratedElo, 0);
@@ -898,6 +975,7 @@ export class GameController {
     this.ratedElo = settings.elo;
     this.ratingRecord = null;
     this.resigned = null;
+    this.imported = null;
     this.interrupt();
     this.chess.reset();
     this.annotations = [];
@@ -933,6 +1011,7 @@ export class GameController {
       arrows: [],
       feedback: null,
       engineError: null,
+      importProgress: null,
     });
   }
 
@@ -952,6 +1031,7 @@ export class GameController {
       ratedElo: this.ratedElo,
       ratingRecord: this.ratingRecord,
       resigned: this.resigned,
+      imported: this.imported,
     };
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(data));
@@ -984,13 +1064,16 @@ export class GameController {
       this.ratedElo = typeof data.ratedElo === "number" ? data.ratedElo : 0;
       this.ratingRecord = data.ratingRecord ?? null;
       this.resigned = data.resigned === "w" || data.resigned === "b" ? data.resigned : null;
+      this.imported = isImportedInfo(data.imported) ? data.imported : null;
       // A reload while the final move was being graded would otherwise leave the game unrecorded.
-      if (this.isOver()) this.recordGame(true);
+      // An imported game is recorded once its grading finishes, which start() resumes.
+      if (this.isOver() && !this.imported) this.recordGame(true);
     } catch {
       this.chess.reset();
       this.annotations = [];
       this.clock = newClock(getSettings().timeControl);
       this.started = false;
+      this.imported = null;
     }
   }
 

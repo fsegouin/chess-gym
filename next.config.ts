@@ -13,7 +13,8 @@ const csp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self'",
-  `connect-src 'self'${isDev ? " ws: wss:" : ""}`,
+  // Lichess and Chess.com serve the player's own games for the coach to grade.
+  `connect-src 'self' https://lichess.org https://api.chess.com${isDev ? " ws: wss:" : ""}`,
   "worker-src 'self'",
   "object-src 'none'",
   "base-uri 'self'",

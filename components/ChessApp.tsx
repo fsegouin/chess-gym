@@ -10,13 +10,17 @@ import {
   useSyncExternalStore,
   type FocusEvent,
 } from "react";
-import type { PieceSymbol, Square } from "chess.js";
+import type { Color, PieceSymbol, Square } from "chess.js";
+import { readingDelay, type Broadcast } from "@/lib/broadcast";
+import { reviewRequest } from "@/lib/game-review";
 import { getTimeControl } from "@/lib/clock";
-import { CLASS_LABEL, formatScore, negate } from "@/lib/coach";
+import { CLASS_LABEL, formatScore, negate, type Annotation } from "@/lib/coach";
 import type { Score } from "@/lib/engine";
 import { GameController, type Arrow, type GameSnapshot } from "@/lib/game";
 import { buildLesson, hasLessonData, lessonPace } from "@/lib/lesson";
 import type { MoveInput as MoveChoice } from "@/lib/moves";
+import { BackgroundGrader } from "@/lib/grader";
+import { parsePgn, type ImportedGame } from "@/lib/pgn";
 import { PuzzleBoard, SESSION_SIZE } from "@/lib/puzzle";
 import { PROVISIONAL_GAMES, useRating } from "@/lib/rating";
 import { BoardScene } from "@/lib/scene/BoardScene";
@@ -24,12 +28,18 @@ import { ELO_MAX, getSettings, MODE_OPTIONS, updateSettings, useSettings } from 
 import { playSound, renderPlacement, setSoundMaterial, unlockAudio, type SoundKind } from "@/lib/sound";
 import { pieceName, sanToSpeech, squareSpeech } from "@/lib/speech";
 import { prefersDark, resolveTheme, THEMES, usePrefersDark } from "@/lib/themes";
+import { checkAccount } from "@/lib/accounts";
+import { AUTO_CHECK_MS, nextUngraded, useSync, type SyncedGame } from "@/lib/sync";
 import { duePuzzles, gradePuzzle, useTraining, type Puzzle, type PuzzleResult } from "@/lib/training";
+import { BroadcastLibrary } from "./BroadcastLibrary";
+import { CoachNotesDialog } from "./CoachNotesDialog";
+import { BroadcastPanel } from "./BroadcastPanel";
 import { Clocks } from "./Clocks";
 import { CoachCard } from "./CoachCard";
 import { EvalBar } from "./EvalBar";
 import { FeedbackChip } from "./FeedbackChip";
 import { GameOverCard } from "./GameOverCard";
+import { ImportDialog } from "./ImportDialog";
 import { IconFlag, IconGear, IconHint, IconKeyboard, IconPlus, IconResetView, IconTarget, IconUndo } from "./icons";
 import { LessonPanel } from "./LessonPanel";
 import { MoveInput } from "./MoveInput";
@@ -72,7 +82,10 @@ type PuzzleRun = {
   seq: number;
 };
 
-/** What the board shows instead of the live game: a replayed move, a lesson step or a puzzle. */
+/** Chess TV: a famous game played back with commentary. `index` -1 is the start, `moves.length` the end. */
+type TvView = { broadcast: Broadcast; index: number; playing: boolean; animate: boolean; seq: number };
+
+/** What the board shows instead of the live game: a replayed move, a lesson step, a puzzle or Chess TV. */
 type BoardOverride = {
   key: string;
   fen: string;
@@ -96,7 +109,12 @@ const TILT_STEP = 0.08;
 function statusText(game: GameSnapshot): string {
   if (game.engineError) return "Engine unavailable";
   if (!game.started) return "Choose your game";
+  if (game.importProgress) return `Grading your moves, ${game.importProgress.done} of ${game.importProgress.total}`;
   const s = game.status;
+  if (s.kind === "imported") {
+    if (s.winner) return s.winner === game.playerColor ? "Imported game. You won" : "Imported game. You lost";
+    return s.result === "1/2-1/2" ? "Imported game. Draw" : "Imported game, unfinished";
+  }
   const you = (winner: string) => winner === game.playerColor;
   if (s.kind === "checkmate") return you(s.winner) ? "Checkmate. You win" : "Checkmate. You lose";
   if (s.kind === "timeout") return you(s.winner) ? "Opponent ran out of time. You win" : "Out of time. You lose";
@@ -171,7 +189,14 @@ export default function ChessApp() {
   const [lessonView, setLessonView] = useState<LessonView | null>(null);
   const [puzzleRun, setPuzzleRun] = useState<PuzzleRun | null>(null);
   const [trainingOpen, setTrainingOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [tv, setTv] = useState<TvView | null>(null);
+  const [tvError, setTvError] = useState<string | null>(null);
+  const tvActive = tv !== null;
   const trainingData = useTraining();
+  const sync = useSync();
   // Puzzles fall due over time; a coarse clock keeps the count fresh without rendering every second.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -202,7 +227,7 @@ export default function ChessApp() {
   const mover = puzzleBoard ?? controller;
   const moverColor = puzzleBoard ? puzzleBoard.turn : game.playerColor;
   const positionId = puzzleRun ? -1 - puzzleRun.seq : game.positionId;
-  const canMove = puzzleRun ? puzzleSolving : controller.canMove() && !replay && !lessonActive;
+  const canMove = tvActive ? false : puzzleRun ? puzzleSolving : controller.canMove() && !replay && !lessonActive;
   const selected = selection && selection.positionId === positionId && canMove ? selection.square : null;
   const targets = useMemo(
     () => (selected ? mover.legalTargets(selected) : []),
@@ -260,6 +285,31 @@ export default function ChessApp() {
 
   const override = ((): BoardOverride | null => {
     const h = game.history;
+    if (tv) {
+      const moves = tv.broadcast.moves;
+      const key = `tv-${tv.seq}`;
+      if (tv.index < 0) return { key, fen: moves[0].before, prevFen: null, move: null, lastMove: null, arrows: [], speed: 1 };
+      const m = moves[Math.min(tv.index, moves.length - 1)];
+      const move = { from: m.from, to: m.to };
+      const atMove = tv.index < moves.length;
+      // A decisive slip shows what was played against the engine's choice; a decisive good move shows itself.
+      const weak = m.cls === "inaccuracy" || m.cls === "mistake" || m.cls === "blunder";
+      const arrows: Arrow[] =
+        atMove && m.moment
+          ? weak && m.best
+            ? [uciArrow(`${m.from}${m.to}`, "played"), uciArrow(m.best.uci, "best")]
+            : [uciArrow(`${m.from}${m.to}`, "best")]
+          : [];
+      return {
+        key,
+        fen: m.after,
+        prevFen: atMove && tv.animate ? m.before : null,
+        move: atMove && tv.animate ? move : null,
+        lastMove: move,
+        arrows,
+        speed: 1,
+      };
+    }
     if (puzzleRun) {
       const revealed = puzzleRun.phase === "revealed" && currentPuzzle;
       return {
@@ -410,7 +460,7 @@ export default function ChessApp() {
   // Before Start the board and clocks follow the colour chosen in Settings (White when random).
   // A puzzle is seen from the side to move; the finished session keeps the last one's view.
   const puzzleSide = puzzleRun ? sideToMove(puzzleRun.queue[Math.min(puzzleRun.index, puzzleRun.queue.length - 1)].fen) : null;
-  const viewSide = puzzleSide ?? (game.started ? game.playerColor : settings.playerColor === "b" ? "b" : "w");
+  const viewSide = tvActive ? "w" : puzzleSide ?? (game.started ? game.playerColor : settings.playerColor === "b" ? "b" : "w");
 
   useEffect(() => {
     if (sceneReady) sceneRef.current?.setOrientation(viewSide);
@@ -562,7 +612,7 @@ export default function ChessApp() {
 
   const handleTap = (square: Square | null) => {
     unlockAudio();
-    if (promotion || lessonActive) return;
+    if (promotion || lessonActive || tvActive) return;
     if (replay) {
       goLive();
       return;
@@ -646,6 +696,73 @@ export default function ChessApp() {
       move: null,
       seq: 0,
     });
+  };
+
+  const openBroadcast = async (slug: string) => {
+    setTvError(null);
+    try {
+      const res = await fetch(`/broadcasts/${encodeURIComponent(slug)}.json`);
+      if (!res.ok) throw new Error(String(res.status));
+      const broadcast = (await res.json()) as Broadcast;
+      if (puzzleActive) exitPractice();
+      setLessonView(null);
+      setView(null);
+      setSelection(null);
+      setLibraryOpen(false);
+      setTv({ broadcast, index: -1, playing: false, animate: false, seq: 0 });
+    } catch {
+      setTvError("That game could not be loaded. Try again later.");
+    }
+  };
+
+  const tvGo = (delta: number) => {
+    if (!tv) return;
+    const total = tv.broadcast.moves.length;
+    const index = Math.max(-1, Math.min(total, tv.index + delta));
+    if (index === tv.index) return;
+    const forward = delta > 0;
+    const move = tv.broadcast.moves[index];
+    // Leaving the start or a decisive moment plays on; reaching a moment, going back or the end stops.
+    const resume = tv.index < 0 || tv.playing || Boolean(tv.broadcast.moves[tv.index]?.moment);
+    const playing = forward && index < total && !move?.moment && resume;
+    setTv({ ...tv, index, playing, animate: forward, seq: tv.seq + 1 });
+    if (forward && move && settings.sound) {
+      const { kind, piece } = sanSound(move.san, index === total - 1);
+      playSound(kind, { piece, to: move.to });
+    }
+  };
+
+  const toggleTvPlay = () => {
+    if (!tv) return;
+    if (tv.index < 0 || tv.broadcast.moves[tv.index]?.moment) tvGo(1);
+    else setTv({ ...tv, playing: !tv.playing });
+  };
+
+  const advanceTv = useEffectEvent(() => tvGo(1));
+  const tvPlaying = tv?.playing ?? false;
+  const tvIndex = tv?.index;
+  const tvDelay = tv && tv.index >= 0 && tv.index < tv.broadcast.moves.length ? readingDelay(tv.broadcast.moves[tv.index].comment) : 0;
+  useEffect(() => {
+    if (!tvPlaying) return;
+    const id = window.setTimeout(() => advanceTv(), tvDelay);
+    return () => window.clearTimeout(id);
+  }, [tvPlaying, tvIndex, tvDelay]);
+
+  const importGame = (imported: ImportedGame, color: Color, graded?: { gameId: string; annotations: (Annotation | null)[] }) => {
+    if (puzzleActive) exitPractice();
+    controller.importGame(imported, color, graded);
+    setLessonView(null);
+    setSelection(null);
+    setView(null);
+    setImportOpen(false);
+  };
+
+  const reviewOnline = (synced: SyncedGame) => {
+    const parsed = parsePgn(synced.pgn);
+    if (!parsed.ok || !synced.annotations) return;
+    setTrainingOpen(false);
+    setTv(null);
+    importGame(parsed.game, synced.playerColor, { gameId: synced.id, annotations: synced.annotations });
   };
 
   const exitPractice = () => {
@@ -819,19 +936,39 @@ export default function ChessApp() {
 
   const onKey = useEffectEvent((e: KeyboardEvent) => {
     if (e.defaultPrevented || isTypingTarget(e.target)) return;
-    if (settingsOpen || newGameOpen || shortcutsOpen || trainingOpen) return; // Dialogs own the keyboard.
+    if (settingsOpen || newGameOpen || shortcutsOpen || trainingOpen || importOpen || libraryOpen || notesOpen) return; // Dialogs own the keyboard.
     // Before the first game only help, settings, the mode switch and the camera apply.
     const cameraKey = (e.shiftKey && e.key.startsWith("Arrow")) || ["v", "f", "+", "=", "-", "_"].includes(e.key.toLowerCase());
-    if (!game.started && !puzzleActive && !cameraKey && !["?", "escape", "s", "m", "p"].includes(e.key.toLowerCase())) return;
+    if (!game.started && !puzzleActive && !tvActive && !cameraKey && !["?", "escape", "s", "m", "p", "i", "w"].includes(e.key.toLowerCase())) return;
     const key = e.key;
     const lower = key.toLowerCase();
 
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && lower === "z" && !puzzleActive) {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && lower === "z" && !puzzleActive && !tvActive) {
       e.preventDefault();
       undo();
       return;
     }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+    if (tv) {
+      const onPageOrBoard = !e.target || e.target === document.body || boardRef.current?.contains(e.target as Node);
+      const tvKeys: Record<string, () => void> = {
+        ArrowRight: () => tvGo(1),
+        ArrowLeft: () => tvGo(-1),
+        p: toggleTvPlay,
+        Escape: () => setTv(null),
+        Home: () => setTv({ ...tv, index: -1, playing: false, animate: false, seq: tv.seq + 1 }),
+      };
+      if ((key === "Enter" || key === " ") && onPageOrBoard) tvKeys[key] = key === " " ? toggleTvPlay : () => tvGo(1);
+      const action = e.shiftKey ? undefined : (tvKeys[key] ?? tvKeys[lower]);
+      if (action) {
+        e.preventDefault();
+        action();
+        return;
+      }
+      // Help and camera keys still work while watching; nothing else touches the game.
+      if (!cameraKey && key !== "?") return;
+    }
 
     if (lessonView) {
       const onPageOrBoard = !e.target || e.target === document.body || boardRef.current?.contains(e.target as Node);
@@ -949,6 +1086,8 @@ export default function ChessApp() {
       },
       m: () => updateSettings({ mode: settings.mode === "play" ? "training" : "play" }),
       p: () => setTrainingOpen(true),
+      i: () => setImportOpen(true),
+      w: () => setLibraryOpen(true),
       s: () => setSettingsOpen(true),
       r: retry,
       t: () => controller.toggleThreat(),
@@ -1001,9 +1140,37 @@ export default function ChessApp() {
   const gamePuzzleCount = trainingData.puzzles.filter((p) => p.id.startsWith(`${game.gameId}-`)).length;
   // Practice pauses nothing, so a running clock would keep ticking; untimed or finished games are fine.
   const practiceBlocked = game.started && !over && game.clock.limited ? "Finish your timed game first." : null;
+  const tvStatus = tv
+    ? tv.index < 0
+      ? "Chess TV"
+      : tv.index >= tv.broadcast.moves.length
+        ? `Chess TV, ${tv.broadcast.result}`
+        : `Chess TV, move ${Math.floor(tv.index / 2) + 1}`
+    : null;
   const puzzleStatus = puzzleRun ? (currentPuzzle ? `${puzzleSide === "b" ? "Black" : "White"} to play` : "Practice complete") : null;
   const lastPly = game.history.length - 1;
   const opponentStrength = settings.elo >= ELO_MAX ? "Max" : String(settings.elo);
+
+  // Linked accounts are checked for new games on a visit after a while away.
+  const linked = sync.accounts.map((a) => `${a.site}:${a.username}`).join(",");
+  const checkStale = useEffectEvent(() => {
+    for (const account of sync.accounts) {
+      if (Date.now() - account.checkedAt > AUTO_CHECK_MS) void checkAccount(account).catch(() => {});
+    }
+  });
+  useEffect(() => {
+    if (linked) checkStale();
+  }, [linked]);
+
+  // Synced games are graded in the background, but never while a game is being played.
+  const hasUngraded = nextUngraded(sync) !== null;
+  const playing = game.started && !over;
+  useEffect(() => {
+    if (!hasUngraded || playing) return;
+    const grader = new BackgroundGrader();
+    void grader.run().catch(() => {});
+    return () => grader.stop();
+  }, [hasUngraded, playing]);
 
   const gameSpeech = useMemo(() => {
     const parts: string[] = [];
@@ -1132,7 +1299,14 @@ export default function ChessApp() {
           and question mark for every shortcut.
         </p>
 
-        {training && settings.showEvalBar && !puzzleActive && (
+        {tv && settings.showEvalBar && (
+          <EvalBar
+            score={tv.index >= 0 ? tv.broadcast.moves[Math.min(tv.index, tv.broadcast.moves.length - 1)].evaluation : null}
+            bottom="w"
+            pending={false}
+          />
+        )}
+        {training && settings.showEvalBar && !puzzleActive && !tvActive && (
           <EvalBar score={lessonActive ? lessonEval : game.evaluation} bottom={game.playerColor} pending={game.reviewing && !game.evaluation} />
         )}
 
@@ -1140,10 +1314,10 @@ export default function ChessApp() {
           <div className={`status-pill${over ? " is-over" : ""}`}>
             {busy && <span className="spinner" aria-hidden />}
             <span>
-              {puzzleStatus ?? (lessonActive ? "Coach review" : replay ? `Replaying move ${Math.floor(replay.ply / 2) + 1}` : status)}
+              {tvStatus ?? puzzleStatus ?? (lessonActive ? "Coach review" : replay ? `Replaying move ${Math.floor(replay.ply / 2) + 1}` : status)}
             </span>
           </div>
-          {game.feedback && !replay && !lessonActive && !puzzleActive && (
+          {game.feedback && !replay && !lessonActive && !puzzleActive && !tvActive && (
             <FeedbackChip key={game.feedback.id} cls={game.feedback.cls} san={game.feedback.san} />
           )}
         </div>
@@ -1161,7 +1335,7 @@ export default function ChessApp() {
           </button>
         )}
 
-        {!game.started && sceneReady && !puzzleActive && (
+        {!game.started && sceneReady && !puzzleActive && !tvActive && (
           <StartScreen
             choices={startChoices}
             onStart={() => startGame(newGameDefaults)}
@@ -1190,8 +1364,23 @@ export default function ChessApp() {
         )}
       </main>
 
-      <aside className={`panel${puzzleActive ? " is-practice" : ""}`}>
-        {puzzleRun ? (
+      <aside className={`panel${puzzleActive || tvActive ? " is-practice" : ""}`}>
+        {tv ? (
+          <BroadcastPanel
+            broadcast={tv.broadcast}
+            index={tv.index}
+            playing={tv.playing}
+            onPrev={() => tvGo(-1)}
+            onNext={() => tvGo(1)}
+            onTogglePlay={toggleTvPlay}
+            onRestart={() => setTv({ ...tv, index: -1, playing: false, animate: false, seq: tv.seq + 1 })}
+            onExit={() => setTv(null)}
+            onLibrary={() => {
+              setTv(null);
+              setLibraryOpen(true);
+            }}
+          />
+        ) : puzzleRun ? (
           <>
             <PuzzlePanel
               puzzle={currentPuzzle}
@@ -1223,6 +1412,13 @@ export default function ChessApp() {
               clock={game.started ? game.clock : previewClock(settings.timeControl)}
               playerColor={viewSide}
               opponentStrength={opponentStrength}
+              players={
+                game.imported
+                  ? game.playerColor === "w"
+                    ? { you: game.imported.white, opponent: game.imported.black }
+                    : { you: game.imported.black, opponent: game.imported.white }
+                  : null
+              }
             />
 
             <div className="panel-info">
@@ -1239,7 +1435,9 @@ export default function ChessApp() {
                   {game.ratingRecord.change} this game
                 </span>
               ) : (
-                <span className="muted">{!game.started ? "Not started" : game.rated ? "Rated game" : "Unrated"}</span>
+                <span className="muted">
+                  {!game.started ? "Not started" : game.imported ? "Imported game" : game.rated ? "Rated game" : "Unrated"}
+                </span>
               )}
             </div>
 
@@ -1266,9 +1464,11 @@ export default function ChessApp() {
                 ratingRecord={game.ratingRecord}
                 canReview={canReview}
                 newPuzzles={gamePuzzleCount}
+                progress={game.importProgress}
                 onReview={startLesson}
                 onNewGame={() => setNewGameOpen(true)}
                 onPractise={startPractice}
+                onNotes={() => setNotesOpen(true)}
               />
             ) : replayEntry && replay ? (
               <ReplayBanner
@@ -1304,7 +1504,7 @@ export default function ChessApp() {
                 type="button"
                 className="action"
                 onClick={undo}
-                disabled={game.history.length === 0}
+                disabled={game.history.length === 0 || game.imported !== null}
                 aria-keyshortcuts="U"
               >
                 <IconUndo />
@@ -1357,6 +1557,10 @@ export default function ChessApp() {
           abandonsRatedGame={controller.isRatedInProgress()}
           onCancel={() => setNewGameOpen(false)}
           onStart={startGame}
+          onImport={() => {
+            setNewGameOpen(false);
+            setImportOpen(true);
+          }}
         />
       )}
       {shortcutsOpen && <ShortcutsDialog onClose={() => setShortcutsOpen(false)} />}
@@ -1364,7 +1568,45 @@ export default function ChessApp() {
         <TrainingDialog
           blockedReason={practiceBlocked}
           onPractise={startPractice}
+          onImport={() => {
+            setTrainingOpen(false);
+            setImportOpen(true);
+          }}
+          onWatch={() => {
+            setTrainingOpen(false);
+            setLibraryOpen(true);
+          }}
+          onReviewOnline={reviewOnline}
           onClose={() => setTrainingOpen(false)}
+        />
+      )}
+      {notesOpen && canReview && (
+        <CoachNotesDialog
+          gameId={game.gameId}
+          request={reviewRequest(game.history, game.playerColor, status)}
+          onShowMove={(ply) => {
+            setNotesOpen(false);
+            setLessonView(null);
+            setView((v) => ({ ply, seq: (v?.seq ?? 0) + 1, animate: true }));
+          }}
+          onClose={() => setNotesOpen(false)}
+        />
+      )}
+      {libraryOpen && (
+        <BroadcastLibrary
+          blockedReason={practiceBlocked ?? tvError}
+          onPick={(slug) => void openBroadcast(slug)}
+          onClose={() => {
+            setLibraryOpen(false);
+            setTvError(null);
+          }}
+        />
+      )}
+      {importOpen && (
+        <ImportDialog
+          abandonsRatedGame={controller.isRatedInProgress()}
+          onImport={importGame}
+          onCancel={() => setImportOpen(false)}
         />
       )}
     </div>
